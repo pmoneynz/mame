@@ -131,6 +131,7 @@ public:
 		, m_keys(*this, "Y%u", 0)
 		, m_drums(*this, "PB%u", 0)
 		, m_dataentry(*this, "DATAENTRY")
+		, m_variation(*this, "VARIATION")
 		, m_config(*this, "CONFIG")
 		, m_key_scan_row(0)
 		, m_drum_scan_row(0)
@@ -157,6 +158,7 @@ private:
 	required_ioport_array<8> m_keys;
 	required_ioport_array<4> m_drums;
 	required_ioport m_dataentry;
+	required_ioport m_variation;
 	required_ioport m_config;
 
 	static constexpr offs_t WAVE_BANK = 2 << 20;
@@ -172,6 +174,21 @@ private:
 	uint8_t adcexp_pa_r();
 	void adcexp_pa_w(uint8_t data);
 	void adcexp_pc_w(uint8_t data);
+
+	int m_subcpu_txd, m_panel_link_txd, m_hle_txd;
+	void subcpu_txd_w(int state);
+	void panel_link_w(int state);
+	void panel_rx_update();
+
+	emu_timer *m_hle_scan_timer, *m_hle_bit_timer;
+	uint8_t m_hle_keys[8], m_hle_drums[4], m_hle_dial, m_hle_variation;
+	uint8_t m_hle_fifo[256];
+	uint8_t m_hle_head, m_hle_tail;
+	uint16_t m_hle_frame;
+	uint8_t m_hle_bits;
+	void hle_send(uint8_t a, uint8_t b, uint8_t c);
+	TIMER_CALLBACK_MEMBER(hle_scan);
+	TIMER_CALLBACK_MEMBER(hle_bit);
 
 	static void floppies(device_slot_interface &device);
 
@@ -226,6 +243,28 @@ void mpc3000_state::machine_start()
 	save_item(NAME(m_adc_pa));
 	save_item(NAME(m_adc_pc));
 	save_item(NAME(m_simm_latch));
+	m_subcpu_txd = m_panel_link_txd = m_hle_txd = 1;
+	save_item(NAME(m_subcpu_txd));
+	save_item(NAME(m_panel_link_txd));
+	save_item(NAME(m_hle_txd));
+
+	m_hle_scan_timer = timer_alloc(FUNC(mpc3000_state::hle_scan), this);
+	m_hle_bit_timer = timer_alloc(FUNC(mpc3000_state::hle_bit), this);
+	std::fill(std::begin(m_hle_keys), std::end(m_hle_keys), 0);
+	std::fill(std::begin(m_hle_drums), std::end(m_hle_drums), 0);
+	m_hle_dial = m_hle_variation = 0;
+	m_hle_head = m_hle_tail = 0;
+	m_hle_frame = 0;
+	m_hle_bits = 0;
+	save_item(NAME(m_hle_keys));
+	save_item(NAME(m_hle_drums));
+	save_item(NAME(m_hle_dial));
+	save_item(NAME(m_hle_variation));
+	save_item(NAME(m_hle_fifo));
+	save_item(NAME(m_hle_head));
+	save_item(NAME(m_hle_tail));
+	save_item(NAME(m_hle_frame));
+	save_item(NAME(m_hle_bits));
 	machine().save().register_postload(save_prepost_delegate(FUNC(mpc3000_state::wave_decode), this));
 	m_smpte_bus = 0;
 	save_item(NAME(m_smpte_bus));
@@ -249,6 +288,23 @@ void mpc3000_state::machine_reset()
 	m_simm_sense = SIMM_SENSE[simm];
 	m_simm_latch = 0;
 	wave_decode();
+
+	m_hle_head = m_hle_tail = 0;
+	m_hle_bits = 0;
+	m_hle_txd = 1;
+	m_hle_bit_timer->enable(false);
+	if (!BIT(cfg, 6))
+	{
+		for (int row = 0; row < 8; row++)
+			m_hle_keys[row] = ~m_keys[row]->read() & 0xff;
+		for (int n = 0; n < 4; n++)
+			m_hle_drums[n] = m_drums[n]->read() & 0xf0;
+		m_hle_dial = m_dataentry->read() & 0xff;
+		m_hle_variation = m_variation->read() * 0x7f / 100;
+		m_hle_scan_timer->adjust(attotime::from_msec(1), 0, attotime::from_msec(1));
+	}
+	else
+		m_hle_scan_timer->enable(false);
 }
 
 // The sizing routine at D0C0:0100 (linear 0x50D00) probes each 2 MB bank
@@ -285,6 +341,110 @@ void mpc3000_state::adcexp_pc_w(uint8_t data)
 		wave_decode();
 	}
 	m_adc_pc = data;
+}
+
+// uPD78C10 TxD drives TE7774 RXD3 and RXD4. The "panel" MIDI port and the
+// panel HLE inject the same byte stream when the panel ROM is unavailable;
+// idle-high lines are combined as a wired AND.
+void mpc3000_state::panel_rx_update()
+{
+	const int line = m_subcpu_txd & m_panel_link_txd & m_hle_txd;
+	m_sio->rx_w<2>(line);
+	m_sio->rx_w<3>(line);
+}
+
+void mpc3000_state::subcpu_txd_w(int state)
+{
+	m_subcpu_txd = state;
+	panel_rx_update();
+}
+
+void mpc3000_state::panel_link_w(int state)
+{
+	m_panel_link_txd = state;
+	panel_rx_update();
+}
+
+// Panel HLE: frames per the V53 parser at D547:0105 (linear 0x55575).
+//   90 kk vv  key kk >= 0x40 (vv 7F press, 00 release); pad kk < 0x10
+//   E0 dd dd  data entry: dd 00 queues '+', 7F queues '-'
+//   B0 xx vv  note variation slider value vv (first data byte ignored)
+// Key codes: button identity from emulated screen effects (emu/key_sweep.py);
+// Rec/Over Dub order and After are inferred, not observed.
+static constexpr uint8_t HLE_KEY_CODES[8][8] = {
+	{ 0x5c, 0x40, 0x43, 0x44, 0x45, 0x4e, 0x51, 0x50 },  // Pad Bank, Full Level, 7, 8, 9, Disk, Program/Sounds, Mixer/Effects
+	{ 0x41, 0x79, 0x4b, 0x4c, 0x4d, 0x5a, 0x52, 0x5b },  // 16 Levels, Assign, 4, 5, 6, MIDI, Song, Other
+	{ 0x42, 0x00, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59 },  // After, -, 1, 2, 3, Seq Edit, Step Edit, Edit Loop
+	{ 0x46, 0x47, 0x5e, 0x5d, 0x5f, 0x4f, 0x63, 0x64 },  // Soft 1, Soft 2, 0, ., Enter, Tempo/Sync, Transpose, Simul Seq
+	{ 0x48, 0x49, 0x00, 0x6f, 0x70, 0x61, 0x69, 0x60 },  // Soft 3, Soft 4, -, <<, <, Auto Punch, Count In, Wait For
+	{ 0x00, 0x00, 0x6e, 0x65, 0x6a, 0x62, 0x6b, 0x6c },  // -, -, -, +, Left, Up, Down, Right
+	{ 0x00, 0x00, 0x00, 0x66, 0x67, 0x68, 0x6d, 0x4a },  // -, -, -, Erase, Timing Correct, Tap Tempo, Main Screen, Help
+	{ 0x76, 0x77, 0x78, 0x74, 0x75, 0x71, 0x72, 0x73 },  // Stop, Play, Play Start, Rec, Over Dub, Locate, >, >>
+};
+
+void mpc3000_state::hle_send(uint8_t a, uint8_t b, uint8_t c)
+{
+	for (uint8_t byte : { a, b, c })
+	{
+		if (uint8_t(m_hle_tail + 1) == m_hle_head)
+			return;
+		m_hle_fifo[m_hle_tail++] = byte;
+	}
+	if (!m_hle_bit_timer->enabled())
+		m_hle_bit_timer->adjust(attotime::zero, 0, attotime::from_hz(31250));
+}
+
+TIMER_CALLBACK_MEMBER(mpc3000_state::hle_scan)
+{
+	for (int row = 0; row < 8; row++)
+	{
+		const uint8_t now = ~m_keys[row]->read() & 0xff;
+		const uint8_t changed = now ^ m_hle_keys[row];
+		m_hle_keys[row] = now;
+		for (int bit = 0; bit < 8; bit++)
+			if (BIT(changed, bit) && HLE_KEY_CODES[row][bit])
+				hle_send(0x90, HLE_KEY_CODES[row][bit], BIT(now, bit) ? 0x7f : 0x00);
+	}
+
+	// Layout: PBn bit 4..7 is pad row 1..4 from the bottom, PB3 the left column.
+	// The OS maps raw pad r to pad (table CS:0057)[r], i.e. r = pad ^ 0x0c.
+	for (int n = 0; n < 4; n++)
+	{
+		const uint8_t now = m_drums[n]->read() & 0xf0;
+		const uint8_t changed = now ^ m_hle_drums[n];
+		m_hle_drums[n] = now;
+		for (int bit = 4; bit < 8; bit++)
+			if (BIT(changed, bit))
+				hle_send(0x90, ((bit - 4) * 4 + (3 - n)) ^ 0x0c, BIT(now, bit) ? 0x7f : 0x00);
+	}
+
+	const uint8_t dial = m_dataentry->read() & 0xff;
+	for (int8_t delta = int8_t(dial - m_hle_dial); delta; delta += delta > 0 ? -1 : 1)
+		hle_send(0xe0, delta > 0 ? 0x00 : 0x7f, delta > 0 ? 0x00 : 0x7f);
+	m_hle_dial = dial;
+
+	const uint8_t variation = m_variation->read() * 0x7f / 100;
+	if (variation != m_hle_variation)
+		hle_send(0xb0, 0x00, variation);
+	m_hle_variation = variation;
+}
+
+TIMER_CALLBACK_MEMBER(mpc3000_state::hle_bit)
+{
+	if (!m_hle_bits)
+	{
+		if (m_hle_head == m_hle_tail)
+		{
+			m_hle_bit_timer->enable(false);
+			return;
+		}
+		m_hle_frame = (m_hle_fifo[m_hle_head++] << 1) | 0x200;  // start 0, 8 data LSB first, stop 1
+		m_hle_bits = 10;
+	}
+	m_hle_txd = m_hle_frame & 1;
+	m_hle_frame >>= 1;
+	m_hle_bits--;
+	panel_rx_update();
 }
 
 // I/O 0x50 is the I-0055 SMPTE option (IC26 socket). The OS probe at
@@ -575,8 +735,7 @@ void mpc3000_state::mpc3000(machine_config &config)
 
 	UPD78C10(config, m_subcpu, 12_MHz_XTAL);
 	m_subcpu->set_addrmap(AS_PROGRAM, &mpc3000_state::mpc3000_sub_map);
-	m_subcpu->txd_func().set(m_sio, FUNC(te7774_device::rx_w<2>));      // 7810 TxD is wire-ORed to channels 2 & 3 RxD
-	m_subcpu->txd_func().append(m_sio, FUNC(te7774_device::rx_w<3>));
+	m_subcpu->txd_func().set(FUNC(mpc3000_state::subcpu_txd_w));
 	m_subcpu->pa_in_cb().set(FUNC(mpc3000_state::subcpu_pa_r));
 	m_subcpu->pb_in_cb().set(FUNC(mpc3000_state::subcpu_pb_r));
 	m_subcpu->pb_out_cb().set(FUNC(mpc3000_state::subcpu_pb_w));
@@ -643,6 +802,10 @@ void mpc3000_state::mpc3000(machine_config &config)
 	auto &mdin2(MIDI_PORT(config, "mdin2"));
 	midiin_slot(mdin2);
 	mdin2.rxd_handler().set(m_sio, FUNC(te7774_device::rx_w<1>));
+
+	auto &panel(MIDI_PORT(config, "panel"));
+	midiin_slot(panel);
+	panel.rxd_handler().set(FUNC(mpc3000_state::panel_link_w));
 
 	midiout_slot(MIDI_PORT(config, "mdout"));
 	midiout_slot(MIDI_PORT(config, "mdout2"));
@@ -805,6 +968,9 @@ static INPUT_PORTS_START( mpc3000 )
 	PORT_CONFNAME(0x08, 0x00, "I-0055 SMPTE option")
 	PORT_CONFSETTING(0x00, "Not installed")
 	PORT_CONFSETTING(0x08, "Installed (unmodelled)")
+	PORT_CONFNAME(0x40, 0x00, "Front panel")
+	PORT_CONFSETTING(0x00, "HLE (panel ROM not dumped)")
+	PORT_CONFSETTING(0x40, "uPD78C10 panel ROM")
 
 	PORT_START("DATAENTRY")
 	PORT_BIT( 0xff, 0x00, IPT_DIAL) PORT_SENSITIVITY(100) PORT_KEYDELTA(0) PORT_CODE_DEC(KEYCODE_F14) PORT_CODE_INC(KEYCODE_F15)
