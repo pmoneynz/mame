@@ -125,13 +125,13 @@ public:
 		, m_subcpu(*this, "subcpu")
 		, m_lcdc(*this, "lcdc")
 		, m_dsp(*this, "dsp")
-		, m_mdout(*this, "mdout")
 		, m_fdc(*this, "fdc")
 		, m_floppy(*this, "fdc:0")
 		, m_sio(*this, "sio")
 		, m_keys(*this, "Y%u", 0)
 		, m_drums(*this, "PB%u", 0)
 		, m_dataentry(*this, "DATAENTRY")
+		, m_config(*this, "CONFIG")
 		, m_key_scan_row(0)
 		, m_drum_scan_row(0)
 		, m_variation_slider(0)
@@ -151,13 +151,27 @@ private:
 	required_device<upd7810_device> m_subcpu;
 	required_device<hd61830_device> m_lcdc;
 	required_device<l7a1045_sound_device> m_dsp;
-	required_device<midi_port_device> m_mdout;
 	required_device<upd72069_device> m_fdc;
 	required_device<floppy_connector> m_floppy;
 	required_device<te7774_device> m_sio;
 	required_ioport_array<8> m_keys;
 	required_ioport_array<4> m_drums;
 	required_ioport m_dataentry;
+	required_ioport m_config;
+
+	static constexpr offs_t WAVE_BANK = 2 << 20;
+	static constexpr unsigned WAVE_BANKS = 16;
+
+	std::unique_ptr<uint16_t[]> m_wave_ram;
+	unsigned m_board_banks, m_simm_banks;
+	uint8_t m_simm_sense;
+	uint8_t m_adc_pa, m_adc_pc, m_simm_latch;
+	uint16_t m_smpte_bus;
+
+	void wave_decode();
+	uint8_t adcexp_pa_r();
+	void adcexp_pa_w(uint8_t data);
+	void adcexp_pc_w(uint8_t data);
 
 	static void floppies(device_slot_interface &device);
 
@@ -167,7 +181,6 @@ private:
 	void mpc3000_map(address_map &map) ATTR_COLD;
 	void mpc3000_io_map(address_map &map) ATTR_COLD;
 	void mpc3000_sub_map(address_map &map) ATTR_COLD;
-	void dsp_map(address_map &map) ATTR_COLD;
 
 	uint8_t dma_memr_cb(offs_t offset);
 	void dma_memw_cb(offs_t offset, uint8_t data);
@@ -176,6 +189,8 @@ private:
 	void mpc3000_palette(palette_device &palette) const;
 
 	uint8_t fdc_hc365_r();
+	uint16_t smpte_r(offs_t offset, uint16_t mem_mask);
+	void smpte_w(offs_t offset, uint16_t data, uint16_t mem_mask);
 
 	uint8_t subcpu_pa_r();
 	uint8_t subcpu_pb_r();
@@ -202,10 +217,90 @@ void mpc3000_state::machine_start()
 	save_item(NAME(m_last_dial));
 	save_item(NAME(m_count_dial));
 	save_item(NAME(m_quadrature_phase));
+
+	m_wave_ram = std::make_unique<uint16_t[]>(WAVE_BANKS * WAVE_BANK / 2);
+	save_pointer(NAME(m_wave_ram), WAVE_BANKS * WAVE_BANK / 2);
+	m_board_banks = m_simm_banks = 0;
+	m_simm_sense = 0;
+	m_adc_pa = m_adc_pc = m_simm_latch = 0;
+	save_item(NAME(m_adc_pa));
+	save_item(NAME(m_adc_pc));
+	save_item(NAME(m_simm_latch));
+	machine().save().register_postload(save_prepost_delegate(FUNC(mpc3000_state::wave_decode), this));
+	m_smpte_bus = 0;
+	save_item(NAME(m_smpte_bus));
 }
 
 void mpc3000_state::machine_reset()
 {
+	// Operator's Manual v3.0 p.229-230: Akai 2 MB board or EXM3008 8 MB board,
+	// plus an optional identical SIMM pair (2x1 MB or 2x4 MB). The 32 MB board
+	// is the configuration Vailixi 3.50 docs call "32 Megabyte equipped".
+	static constexpr unsigned BOARD_BANKS[] = { 1, 4, 16 };
+	static constexpr unsigned SIMM_BANKS[] = { 0, 1, 4 };
+	// Nibbles the OS maps to SIMM class 0/1/2 via DGROUP 8010:75C6. Any member
+	// of a class is equivalent to the OS; the wired value is undetermined.
+	static constexpr uint8_t SIMM_SENSE[] = { 0x0f, 0x0e, 0x09 };
+
+	const ioport_value cfg = m_config->read();
+	m_board_banks = BOARD_BANKS[std::min<unsigned>(cfg & 0x03, 2)];
+	const unsigned simm = std::min<unsigned>((cfg >> 4) & 0x03, 2);
+	m_simm_banks = SIMM_BANKS[simm];
+	m_simm_sense = SIMM_SENSE[simm];
+	m_simm_latch = 0;
+	wave_decode();
+}
+
+// The sizing routine at D0C0:0100 (linear 0x50D00) probes each 2 MB bank
+// with the SIMM latch at 0, then sets latch bit 3 whenever it counts SIMM
+// banks, and treats board + SIMM banks as one region from address 0. SIMM
+// banks are therefore decoded after the board only while latch bit 3 is set.
+void mpc3000_state::wave_decode()
+{
+	address_space &wave = m_dsp->space(AS_DATA);
+	const unsigned simm = BIT(m_simm_latch, 3) ? m_simm_banks : 0;
+	const unsigned banks = std::min(m_board_banks + simm, WAVE_BANKS);
+	wave.unmap_readwrite(0, WAVE_BANKS * WAVE_BANK - 1);
+	if (banks)
+		wave.install_ram(0, banks * WAVE_BANK - 1, m_wave_ram.get());
+}
+
+// adcexp PA reads the SIMM sense nibble (CF92:01F3 reads it with PC=0x0E).
+uint8_t mpc3000_state::adcexp_pa_r()
+{
+	return 0xf0 | m_simm_sense;
+}
+
+void mpc3000_state::adcexp_pa_w(uint8_t data)
+{
+	m_adc_pa = data;
+}
+
+// PC0 rising edge latches PA[3:0] into the SIMM decode latch (CF92:01DD).
+void mpc3000_state::adcexp_pc_w(uint8_t data)
+{
+	if (!BIT(m_adc_pc, 0) && BIT(data, 0) && m_simm_latch != (m_adc_pa & 0x0f))
+	{
+		m_simm_latch = m_adc_pa & 0x0f;
+		wave_decode();
+	}
+	m_adc_pc = data;
+}
+
+// I/O 0x50 is the I-0055 SMPTE option (IC26 socket). The OS probe at
+// linear 0x56BEA writes 0x0000 then 0xFFFF and treats a read-back of the
+// written value as "not installed". Without the chip the undriven bus is
+// modelled as holding the last written word.
+uint16_t mpc3000_state::smpte_r(offs_t offset, uint16_t mem_mask)
+{
+	if (BIT(m_config->read(), 3))
+		return 0; // installed: register behaviour unknown
+	return m_smpte_bus;
+}
+
+void mpc3000_state::smpte_w(offs_t offset, uint16_t data, uint16_t mem_mask)
+{
+	COMBINE_DATA(&m_smpte_bus);
 }
 
 void mpc3000_state::mpc3000_map(address_map &map)
@@ -219,6 +314,7 @@ void mpc3000_state::mpc3000_io_map(address_map &map)
 {
 	map(0x0000, 0x0000).w("loledlatch", FUNC(hc259_device::write_nibble_d3));
 	map(0x0020, 0x0020).w("hiledlatch", FUNC(hc259_device::write_nibble_d3));
+	map(0x0050, 0x0051).rw(FUNC(mpc3000_state::smpte_r), FUNC(mpc3000_state::smpte_w));
 	map(0x0060, 0x006f).m(m_dsp, FUNC(l7a1045_sound_device::map));
 	map(0x0080, 0x0087).rw("dioexp", FUNC(i8255_device::read), FUNC(i8255_device::write)).umask16(0x00ff);
 	map(0x00a0, 0x00bf).m("spc", FUNC(mb89352_device::map)).umask16(0x00ff);
@@ -232,11 +328,6 @@ void mpc3000_state::mpc3000_io_map(address_map &map)
 	map(0x00e8, 0x00eb).r(FUNC(mpc3000_state::fdc_hc365_r)).umask16(0xff00);
 	map(0x00f0, 0x00f7).rw("synctmr", FUNC(pit8254_device::read), FUNC(pit8254_device::write)).umask16(0x00ff);
 	map(0x00f8, 0x00ff).rw("adcexp", FUNC(i8255_device::read), FUNC(i8255_device::write)).umask16(0x00ff);
-}
-
-void mpc3000_state::dsp_map(address_map &map)
-{
-	map(0x0000'0000, 0x01ff'ffff).ram();
 }
 
 // bit 0 = ED   1 if disk was not ejected prior to last check,
@@ -495,7 +586,7 @@ void mpc3000_state::mpc3000(machine_config &config)
 	m_subcpu->an1_func().set(FUNC(mpc3000_state::an1_r));
 	m_subcpu->an2_func().set(FUNC(mpc3000_state::an2_r));
 	m_subcpu->an3_func().set(FUNC(mpc3000_state::an3_r));
-	m_subcpu->an3_func().set(FUNC(mpc3000_state::an4_r));
+	m_subcpu->an4_func().set(FUNC(mpc3000_state::an4_r));
 
 	screen_device &screen(SCREEN(config, "screen").set_lcd());
 	screen.set_refresh_hz(80);
@@ -519,7 +610,10 @@ void mpc3000_state::mpc3000(machine_config &config)
 	pit.set_clk<1>(V53_PCLKOUT);
 	pit.set_clk<2>(V53_PCLKOUT);
 
-	I8255(config, "adcexp"); // MB89255B
+	i8255_device &adcexp(I8255(config, "adcexp")); // MB89255B
+	adcexp.in_pa_callback().set(FUNC(mpc3000_state::adcexp_pa_r));
+	adcexp.out_pa_callback().set(FUNC(mpc3000_state::adcexp_pa_w));
+	adcexp.out_pc_callback().set(FUNC(mpc3000_state::adcexp_pc_w));
 	I8255(config, "dioexp"); // MB89255B
 
 	HD61830(config, m_lcdc, 4.9152_MHz_XTAL / 2 / 2); // LC7981
@@ -529,7 +623,10 @@ void mpc3000_state::mpc3000(machine_config &config)
 	INPUT_MERGER_ANY_HIGH(config, "intp5").output_handler().set_inputline(m_maincpu, INPUT_LINE_IRQ5);
 
 	TE7774(config, m_sio, V53_PCLKOUT);
-	m_sio->txd_handler<0>().set(m_mdout, FUNC(midi_port_device::write_txd));
+	m_sio->txd_handler<0>().set("mdout", FUNC(midi_port_device::write_txd));
+	m_sio->txd_handler<1>().set("mdout2", FUNC(midi_port_device::write_txd));
+	m_sio->txd_handler<2>().set("mdout3", FUNC(midi_port_device::write_txd));
+	m_sio->txd_handler<3>().set("mdout4", FUNC(midi_port_device::write_txd));
 	m_sio->rxrdy_handler<0>().set("intp5", FUNC(input_merger_device::in_w<0>));
 	m_sio->rxrdy_handler<1>().set("intp5", FUNC(input_merger_device::in_w<1>));
 	m_sio->rxrdy_handler<2>().set("intp5", FUNC(input_merger_device::in_w<2>));
@@ -543,7 +640,14 @@ void mpc3000_state::mpc3000(machine_config &config)
 	midiin_slot(mdin);
 	mdin.rxd_handler().set(m_sio, FUNC(te7774_device::rx_w<0>));
 
+	auto &mdin2(MIDI_PORT(config, "mdin2"));
+	midiin_slot(mdin2);
+	mdin2.rxd_handler().set(m_sio, FUNC(te7774_device::rx_w<1>));
+
 	midiout_slot(MIDI_PORT(config, "mdout"));
+	midiout_slot(MIDI_PORT(config, "mdout2"));
+	midiout_slot(MIDI_PORT(config, "mdout3"));
+	midiout_slot(MIDI_PORT(config, "mdout4"));
 
 	auto &scsi(NSCSI_BUS(config, "scsi"));
 	NSCSI_CONNECTOR(config, "scsi:0", default_scsi_devices, nullptr);
@@ -563,7 +667,6 @@ void mpc3000_state::mpc3000(machine_config &config)
 	SPEAKER(config, "outputs", 8).unknown();
 
 	L7A1045(config, m_dsp, 33.8688_MHz_XTAL); // clock verified by schematic
-	m_dsp->set_addrmap(AS_DATA, &mpc3000_state::dsp_map);
 	m_dsp->drq_handler_cb().set(m_maincpu, FUNC(v53a_device::dreq_w<3>));
 	m_dsp->add_route(l7a1045_sound_device::L6028_LEFT, "speaker", 1.0, 0);
 	m_dsp->add_route(l7a1045_sound_device::L6028_RIGHT, "speaker", 1.0, 1);
@@ -690,6 +793,19 @@ static INPUT_PORTS_START( mpc3000 )
 	PORT_START("VARIATION")
 	PORT_ADJUSTER(100, "NOTE VARIATION") PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(mpc3000_state::variation_changed), 1)
 
+	PORT_START("CONFIG")
+	PORT_CONFNAME(0x03, 0x00, "Memory board")
+	PORT_CONFSETTING(0x00, "Akai 2 MB (stock)")
+	PORT_CONFSETTING(0x01, "EXM3008 8 MB")
+	PORT_CONFSETTING(0x02, "32 MB")
+	PORT_CONFNAME(0x30, 0x00, "SIMM pair")
+	PORT_CONFSETTING(0x00, "None")
+	PORT_CONFSETTING(0x10, "2 x 1 MB")
+	PORT_CONFSETTING(0x20, "2 x 4 MB")
+	PORT_CONFNAME(0x08, 0x00, "I-0055 SMPTE option")
+	PORT_CONFSETTING(0x00, "Not installed")
+	PORT_CONFSETTING(0x08, "Installed (unmodelled)")
+
 	PORT_START("DATAENTRY")
 	PORT_BIT( 0xff, 0x00, IPT_DIAL) PORT_SENSITIVITY(100) PORT_KEYDELTA(0) PORT_CODE_DEC(KEYCODE_F14) PORT_CODE_INC(KEYCODE_F15)
 INPUT_PORTS_END
@@ -711,6 +827,10 @@ ROM_START( mpc3000 )
 	ROM_SYSTEM_BIOS(3, "v310", "ver 3.10")
 	ROMX_LOAD( "mpc3000__ls__v3.10.am27c020__id0197.ic13_ls.bin", 0x000000, 0x040000, CRC(cbd1b3a6) SHA1(5464a57137549d9d9c47f9aafc2b89f4c0af8b31), ROM_SKIP(1) | ROM_BIOS(3) )
 	ROMX_LOAD( "mpc3000__ms__v3.10.am27c020__id0197.ic14_ms.bin", 0x000001, 0x040000, CRC(e2ba1904) SHA1(27a9f047c63964fac2b453f2317b77834490983d), ROM_SKIP(1) | ROM_BIOS(3) )
+
+	ROM_SYSTEM_BIOS(4, "v308", "ver 3.08")
+	ROMX_LOAD( "mpc3000_v3.08_lsb.bin", 0x000000, 0x040000, CRC(40e6310e) SHA1(d8b2a9d3cc65223f40c2c6954a842160cb58fd9e), ROM_SKIP(1) | ROM_BIOS(4) )
+	ROMX_LOAD( "mpc3000_v3.08_msb.bin", 0x000001, 0x040000, CRC(bab7048e) SHA1(59f1cdc8dec1dc49f6b337da1f9bbc1bfaf259d8), ROM_SKIP(1) | ROM_BIOS(4) )
 
 	ROM_REGION(0x8000, "subcpu", 0)    // uPD78C10 panel controller code
 	ROM_LOAD( "mp3000__op_v1.0.am27c256__id0110.ic602.bin", 0x000000, 0x008000, CRC(b0b783d3) SHA1(a60016184fc07ba00dcc19ba4da60e78aceff63c) )
