@@ -1200,13 +1200,8 @@
 		<element ref="blackbezel"><bounds x="0" y="0" width="72" height="208" /></element>
 	</group>
 
-<!-- Show Everything -->
-	<view name="Default Layout">
-
-		<collection name="script warning">
-			<element ref="script_warning" id="warning"><bounds x="200" y="50" width="1200" height="30"/></element>
-		</collection>
-
+<!-- Whole Panel -->
+	<group name="panel">
 		<element ref="mainbox"><bounds x="0" y="0" width="6381" height="5433" /></element>
 
 <!-- Guide .png image when editing layout -->
@@ -1301,17 +1296,40 @@
 		<element ref="cursor-right-arrow"><bounds x="6060" y="3050" width="60" height="150" /></element>
 		<element ref="cursor-right-arrow-mask"><bounds x="6045" y="3050" width="60" height="150" /></element>
 		<group ref="cursor-buttons"><bounds x="5020" y="2610" width="1090" height="816" /></group>
+	</group>
 
+<!-- Show Everything -->
+	<view name="Default Layout">
+		<collection name="script warning">
+			<element ref="script_warning" id="warning"><bounds x="200" y="50" width="1200" height="30"/></element>
+		</collection>
+		<group ref="panel" />
+	</view>
+
+<!-- Development: the panel with the LCD enlarged over the knobs -->
+	<view name="Large Screen">
+		<group ref="panel" />
+		<element ref="blackbezel"><bounds x="45" y="797" width="3812" height="1243" /></element>
+		<group ref="group-screen"><bounds x="105" y="850" width="3703" height="987" /></group><!--15:4 ratio-->
+		<group ref="group-softbezel-text"><bounds x="180" y="1860" width="3540" height="150" /></group>
+	</view>
+
+<!-- Development: the LCD alone -->
+	<view name="LCD Only">
+		<element ref="blackbezel"><bounds x="0" y="0" width="2480" height="720" /></element>
+		<group ref="group-screen"><bounds x="40" y="40" width="2400" height="640" /></group><!--15:4 ratio-->
 	</view>
 
 	<script><![CDATA[
 		file:set_resolve_tags_callback(
 			function()
-				local view = file.views["Default Layout"]
-				install_slider_callbacks(view)
-				add_simplecounter_knob(view, "dataentry_knob", "DATAENTRY", 1.5)
-				add_vertical_slider(view, "variation_area", "variation_knob", "VARIATION")
-				view.items["warning"]:set_state(0)
+				for _, name in ipairs({"Default Layout", "Large Screen"}) do
+					local view = file.views[name]
+					install_slider_callbacks(view)
+					add_simplecounter_knob(view, "dataentry_knob", "DATAENTRY", 1.5)
+					add_vertical_slider(view, "variation_area", "variation_knob", "VARIATION")
+				end
+				file.views["Default Layout"].items["warning"]:set_state(0)
 			end)
 
 
