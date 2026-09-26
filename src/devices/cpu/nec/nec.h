@@ -63,6 +63,13 @@ protected:
 	void set_nmi_line(int state);
 	void set_poll_line(int state);
 
+	// Bus wait states, programmed by the V53 wait control unit (zero on other chips).
+	// Each CPU bus cycle to a page costs that page's waits in extra clocks.
+	uint8_t   m_mem_waits[512];     // per 32 KiB page of the 24-bit physical space
+	uint16_t  m_refresh_period;     // CPU clocks between refresh bus cycles, 0 = off
+	uint8_t   m_refresh_cycles;     // CPU clocks each refresh bus cycle takes
+	void bus_wait(int clocks) { m_icount -= clocks; }
+
 	address_space_config m_program_config;
 	address_space_config m_io_config;
 
@@ -115,6 +122,8 @@ private:
 	int32_t   m_prefetch_cycles;
 	int32_t   m_prefetch_count;
 	uint8_t   m_prefetch_reset;
+	uint8_t   m_fetch_debt;         // half clock owed by an odd-cost queue stall
+	int32_t   m_refresh_phase;      // CPU clocks since the last refresh bus cycle
 	const uint32_t m_chip_type;
 	// https://github.com/mamedev/mame/pull/15620
 	bool      m_has_div_quirk;
@@ -143,6 +152,14 @@ protected:
 	offs_t v33_translate(offs_t addr);
 
 private:
+	inline offs_t mem_phys(offs_t a);
+	inline void mem_wait(offs_t phys, bool word);
+	inline u8 mem_read_byte(offs_t a);
+	inline u16 mem_read_word(offs_t a);
+	inline void mem_write_byte(offs_t a, u8 d);
+	inline void mem_write_word(offs_t a, u16 d);
+	void refresh_steal(int clocks);
+
 	inline void prefetch();
 	void do_prefetch();
 	inline uint8_t fetch();

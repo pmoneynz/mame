@@ -120,6 +120,23 @@ typedef uint32_t DWORD;
 
 #include "necpriv.ipp"
 
+inline offs_t nec_common_device::mem_phys(offs_t a)
+{
+	return m_chip_type == V33_TYPE ? v33_translate(a) : a;
+}
+
+inline void nec_common_device::mem_wait(offs_t phys, bool word)
+{
+	// A word at an odd address takes two bus cycles on the 16-bit bus
+	if (const int w = m_mem_waits[(phys >> 15) & 0x1ff])
+		m_icount -= (word && (phys & 1)) ? 2 * w : w;
+}
+
+inline u8 nec_common_device::mem_read_byte(offs_t a) { a = mem_phys(a); mem_wait(a, false); return m_program->read_byte(a); }
+inline u16 nec_common_device::mem_read_word(offs_t a) { a = mem_phys(a); mem_wait(a, true); return m_program->read_word_unaligned(a); }
+inline void nec_common_device::mem_write_byte(offs_t a, u8 d) { a = mem_phys(a); mem_wait(a, false); m_program->write_byte(a, d); }
+inline void nec_common_device::mem_write_word(offs_t a, u16 d) { a = mem_phys(a); mem_wait(a, true); m_program->write_word_unaligned(a, d); }
+
 DEFINE_DEVICE_TYPE(V20,  v20_device,  "v20",  "NEC V20")
 DEFINE_DEVICE_TYPE(V30,  v30_device,  "v30",  "NEC V30")
 DEFINE_DEVICE_TYPE(V33,  v33_device,  "v33",  "NEC V33")
@@ -231,26 +248,50 @@ void nec_common_device::do_prefetch()
 	 * of 4. There are however only very few sources publicly
 	 * available and they are vague.
 	 */
+	// Costs are in half clocks: one 16-bit fetch bus cycle queues two bytes,
+	// so its wait states (for the page at PS:IP) are split across both.
+	const int32_t cost = 2 * m_prefetch_cycles + m_mem_waits[(mem_phys((Sreg(PS)<<4) + m_ip) >> 15) & 0x1ff];
+	int32_t budget = 2 * m_cur_cycles;
+
 	while (m_prefetch_count < 0)
 	{
 		m_prefetch_count++;
-		if (m_cur_cycles > m_prefetch_cycles)
-			m_cur_cycles -= m_prefetch_cycles;
+		if (budget > cost)
+			budget -= cost;
 		else
-			m_icount -= m_prefetch_cycles;
+		{
+			const int32_t owed = cost + m_fetch_debt;
+			m_icount -= owed >> 1;
+			m_fetch_debt = owed & 1;
+		}
 	}
 
 	if (m_prefetch_reset)
 	{
+		m_cur_cycles = budget >> 1;
 		m_prefetch_count = 0;
 		m_prefetch_reset = 0;
 		return;
 	}
 
-	while (m_cur_cycles >= m_prefetch_cycles && m_prefetch_count < m_prefetch_size)
+	while (budget >= cost && m_prefetch_count < m_prefetch_size)
 	{
-		m_cur_cycles -= m_prefetch_cycles;
+		budget -= cost;
 		m_prefetch_count++;
+	}
+	m_cur_cycles = budget >> 1;
+}
+
+// Refresh bus cycles take the bus from the CPU once per period. This charges
+// every one; the V53 queues up to seven while the bus is busy, so a CPU that
+// leaves the bus idle can hide some of them (upper bound).
+void nec_common_device::refresh_steal(int clocks)
+{
+	m_refresh_phase += clocks;
+	while (m_refresh_phase >= m_refresh_period)
+	{
+		m_refresh_phase -= m_refresh_period - m_refresh_cycles;
+		m_icount -= m_refresh_cycles;
 	}
 }
 
@@ -466,6 +507,11 @@ void nec_common_device::device_start()
 	m_cur_cycles = 0;
 	m_prefetch_count = 0;
 	m_prefetch_reset = 0;
+	m_fetch_debt = 0;
+	std::fill(std::begin(m_mem_waits), std::end(m_mem_waits), 0);
+	m_refresh_period = 0;
+	m_refresh_cycles = 0;
+	m_refresh_phase = 0;
 	m_prefix_base = 0;
 	m_seg_prefix = 0;
 	m_EA = 0;
@@ -504,6 +550,11 @@ void nec_common_device::device_start()
 	save_item(NAME(m_rep_params));
 	save_item(NAME(m_prefetch_count));
 	save_item(NAME(m_prefetch_reset));
+	save_item(NAME(m_fetch_debt));
+	save_item(NAME(m_mem_waits));
+	save_item(NAME(m_refresh_period));
+	save_item(NAME(m_refresh_cycles));
+	save_item(NAME(m_refresh_phase));
 
 	m_program = &space(AS_PROGRAM);
 	if (m_program->data_width() == 8)
@@ -642,6 +693,7 @@ void nec_common_device::execute_run()
 
 	while(m_icount>0)
 	{
+		const int start = m_icount;
 		m_prev_ip = m_ip;
 
 		// Dispatch IRQ
@@ -670,5 +722,8 @@ void nec_common_device::execute_run()
 				(this->*s_nec80_instruction[fetchop()])();
 		}
 		do_prefetch();
+
+		if (m_refresh_period)
+			refresh_steal(start - m_icount);
 	}
 }

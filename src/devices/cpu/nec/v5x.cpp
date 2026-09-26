@@ -611,7 +611,10 @@ u8 v53_device::io_read_byte(offs_t a)
 	if (check_OPHA(a))
 		return device_v5x_interface::internal_io_read_byte(a);
 	else
+	{
+		external_io_wait(a, false);
 		return nec_common_device::io_read_byte(a);
+	}
 }
 
 u16 v53_device::io_read_word(offs_t a)
@@ -627,7 +630,10 @@ u16 v53_device::io_read_word(offs_t a)
 			return device_v5x_interface::internal_io_read_word(a);
 	}
 	else
+	{
+		external_io_wait(a, true);
 		return nec_common_device::io_read_word(a);
+	}
 }
 
 void v53_device::io_write_byte(offs_t a, u8 v)
@@ -637,7 +643,10 @@ void v53_device::io_write_byte(offs_t a, u8 v)
 		device_v5x_interface::internal_io_write_byte(a, v);
 	}
 	else
+	{
+		external_io_wait(a, false);
 		nec_common_device::io_write_byte(a, v);
+	}
 }
 
 void v53_device::io_write_word(offs_t a, u16 v)
@@ -655,7 +664,61 @@ void v53_device::io_write_word(offs_t a, u16 v)
 		}
 	}
 	else
+	{
+		external_io_wait(a, true);
 		nec_common_device::io_write_word(a, v);
+	}
+}
+
+// External I/O cycles take the WCY3 IOW waits; the system I/O area
+// (0xFF00-0xFFFF) and the relocated internal peripherals take none.
+void v53_device::external_io_wait(offs_t a, bool word)
+{
+	if (m_io_waits && (a & 0xffff) < 0xff00)
+		bus_wait((word && (a & 1)) ? 2 * m_io_waits : m_io_waits);
+}
+
+// uPD70236 data book (NEC 1991), Wait Control Unit, figures 53-61, and
+// Refresh Control Unit, figure 62.
+//   WMB0  ELMB[6:4] EUMB[2:0]  lower/upper blocks of the 16 MiB space, (n+1) MiB each
+//   WMB1  LMB[6:4]  UMB[2:0]   lower/upper blocks of the WAC 1 MiB area, 32K..512K
+//   WAC   UWA[3:0]             which 1 MiB area (A23-A20) WMB1 divides
+//   WCY0  EUMW[2:0]            16 MiB upper block
+//   WCY1  EMMW[6:4] ELMW[2:0]  16 MiB middle and lower blocks
+//   WCY2  MMW[6:4]  LMW[2:0]   1 MiB area middle and lower blocks
+//   WCY3  IOW[6:4]  UMW[2:0]   external I/O; 1 MiB area upper block
+//   WCY4  DMAW[6:4] RFW[2:0]   DMA and refresh cycles
+//   RFC   RE[7] ROB8[6] RTM[4:0]  refresh every 16 x (RTM+1) clocks
+// Assumes the 1 MiB area overrides the 16 MiB blocks it overlaps, and a
+// 16-bit bus for every access (no BS8 devices).
+void v53_device::wcu_update()
+{
+	static constexpr u8 AREA_PAGES[8] = { 1, 2, 3, 4, 6, 8, 12, 16 };  // 32K..512K in 32 KiB pages
+
+	const unsigned lower16 = (BIT(m_WMB0, 4, 3) + 1) * 32;
+	const unsigned upper16 = (BIT(m_WMB0, 0, 3) + 1) * 32;
+	const unsigned lower1 = AREA_PAGES[BIT(m_WMB1, 4, 3)];
+	const unsigned upper1 = AREA_PAGES[BIT(m_WMB1, 0, 3)];
+	const unsigned area = m_WAC * 32;
+
+	for (unsigned page = 0; page < 512; page++)
+	{
+		if (page - area < 32)
+		{
+			const unsigned p = page - area;
+			m_mem_waits[page] = (p < lower1) ? BIT(m_WCY[2], 0, 3) : (p >= 32 - upper1) ? BIT(m_WCY[3], 0, 3) : BIT(m_WCY[2], 4, 3);
+		}
+		else
+			m_mem_waits[page] = (page < lower16) ? BIT(m_WCY[1], 0, 3) : (page >= 512 - upper16) ? BIT(m_WCY[0], 0, 3) : BIT(m_WCY[1], 4, 3);
+	}
+
+	m_io_waits = BIT(m_WCY[3], 4, 3);
+	m_dmau->set_wait_states(BIT(m_WCY[4], 4, 3));
+
+	// A refresh bus cycle is at least 4 clocks (two built-in waits); RFW
+	// stretching it past that is this model's reading of figure 61.
+	m_refresh_period = BIT(m_RFC, 7) ? 16 * (BIT(m_RFC, 0, 5) + 1) : 0;
+	m_refresh_cycles = 2 + std::max(2, int(BIT(m_WCY[4], 0, 3)));
 }
 
 
@@ -695,6 +758,15 @@ void v53_device::device_reset()
 	v33_base_device::device_reset();
 
 	m_SCTL = 0x00;
+
+	// WCY registers reset to all ones: seven waits on every cycle. The
+	// data book gives refresh N=9 at reset; RE and the WMB/WAC reset values
+	// are not stated (they do not matter while every block has seven waits).
+	m_WMB0 = m_WMB1 = m_WAC = 0x00;
+	std::fill(std::begin(m_WCY), std::end(m_WCY), 0x77);
+	m_WCY[0] = 0x07;
+	m_RFC = 0x88;
+	wcu_update();
 }
 
 void v53_device::device_start()
@@ -705,6 +777,12 @@ void v53_device::device_start()
 	set_irq_acknowledge_callback(*m_icu, FUNC(v5x_icu_device::inta_cb));
 
 	save_item(NAME(m_SCTL));
+	save_item(NAME(m_WMB0));
+	save_item(NAME(m_WMB1));
+	save_item(NAME(m_WAC));
+	save_item(NAME(m_WCY));
+	save_item(NAME(m_RFC));
+	save_item(NAME(m_io_waits));
 }
 
 void v53_device::install_peripheral_io()
@@ -822,18 +900,18 @@ void v53_device::internal_port_map(address_map &map)
 	map(0xffe1, 0xffe1).w(FUNC(v53_device::BADR_w));  // uPD71037 DMA mode bank register peripheral mapping (also uses OPHA)
 	// 0xffe2-0xffe9 reserved
 	map(0xffe9, 0xffe9).w(FUNC(v53_device::BRC_w));   // baud rate counter (used for serial peripheral)
-	map(0xffea, 0xffea).w(FUNC(v53_device::WMB0_w));  // waitstate control
-	map(0xffeb, 0xffeb).w(FUNC(v53_device::WCY1_w));  // waitstate control
-	map(0xffec, 0xffec).w(FUNC(v53_device::WCY0_w));  // waitstate control
-	map(0xffed, 0xffed).w(FUNC(v53_device::WAC_w));   // waitstate control
+	map(0xffea, 0xffea).rw(FUNC(v53_device::WMB0_r), FUNC(v53_device::WMB0_w));  // waitstate control
+	map(0xffeb, 0xffeb).rw(FUNC(v53_device::WCY_r<1>), FUNC(v53_device::WCY_w<1>));  // waitstate control
+	map(0xffec, 0xffec).rw(FUNC(v53_device::WCY_r<0>), FUNC(v53_device::WCY_w<0>));  // waitstate control
+	map(0xffed, 0xffed).rw(FUNC(v53_device::WAC_r), FUNC(v53_device::WAC_w));   // waitstate control
 	// 0xffee-0xffef reserved
 	map(0xfff0, 0xfff0).rw(FUNC(v53_device::TCKS_r), FUNC(v53_device::TCKS_w));  // timer clocks
 	map(0xfff1, 0xfff1).w(FUNC(v53_device::SBCR_w));  // internal clock divider, halt behavior etc.
-	map(0xfff2, 0xfff2).w(FUNC(v53_device::RFC_w));   // ram refresh control
-	map(0xfff3, 0xfff3).w(FUNC(v53_device::WMB1_w));  // waitstate control
-	map(0xfff4, 0xfff4).w(FUNC(v53_device::WCY2_w));  // waitstate control
-	map(0xfff5, 0xfff5).w(FUNC(v53_device::WCY3_w));  // waitstate control
-	map(0xfff6, 0xfff6).w(FUNC(v53_device::WCY4_w));  // waitstate control
+	map(0xfff2, 0xfff2).rw(FUNC(v53_device::RFC_r), FUNC(v53_device::RFC_w));   // ram refresh control
+	map(0xfff3, 0xfff3).rw(FUNC(v53_device::WMB1_r), FUNC(v53_device::WMB1_w));  // waitstate control
+	map(0xfff4, 0xfff4).rw(FUNC(v53_device::WCY_r<2>), FUNC(v53_device::WCY_w<2>));  // waitstate control
+	map(0xfff5, 0xfff5).rw(FUNC(v53_device::WCY_r<3>), FUNC(v53_device::WCY_w<3>));  // waitstate control
+	map(0xfff6, 0xfff6).rw(FUNC(v53_device::WCY_r<4>), FUNC(v53_device::WCY_w<4>));  // waitstate control
 	// 0xfff6 reserved
 	map(0xfff8, 0xfff8).rw(FUNC(v53_device::SULA_r), FUNC(v53_device::SULA_w));  // scu mapping
 	map(0xfff9, 0xfff9).rw(FUNC(v53_device::TULA_r), FUNC(v53_device::TULA_w));  // tcu mapping
@@ -853,6 +931,9 @@ void v53_device::execute_set_input(int irqline, int state)
 void v53_device::device_add_mconfig(machine_config &config)
 {
 	v5x_add_mconfig(config);
+
+	// The DMAU runs on the CPU clock (data book, clock generator figure)
+	m_dmau->set_clock(DERIVED_CLOCK(1, 2));
 
 	m_tcu->out_handler<1>().set(FUNC(v53_device::tout1_w));
 	m_scu->sint_handler().set(FUNC(v53_device::sint_w));

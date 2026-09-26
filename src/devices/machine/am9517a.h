@@ -70,6 +70,7 @@ public:
 
 	void hack_w(int state);
 	void ready_w(int state);
+	void set_wait_states(int count) { m_wait_states = count; }  // internal wait generator (V53 WCU)
 	void eop_w(int state);
 
 	template <unsigned C> void dreq_w(int state) { dma_request(C, state); }
@@ -113,6 +114,8 @@ protected:
 	int m_hreq;
 	int m_hack;
 	int m_ready;
+	int m_wait_states;
+	int m_wait_count;
 	int m_eop;
 	int m_state;
 	int m_current_channel;

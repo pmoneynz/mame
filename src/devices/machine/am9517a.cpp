@@ -448,6 +448,8 @@ am9517a_device::am9517a_device(const machine_config &mconfig, device_type type, 
 	m_icount(0),
 	m_hack(0),
 	m_ready(1),
+	m_wait_states(0),
+	m_wait_count(0),
 	m_command(0),
 	m_status(0),
 	m_out_hreq_cb(*this),
@@ -513,6 +515,8 @@ void am9517a_device::device_start()
 	save_item(NAME(m_hreq));
 	save_item(NAME(m_hack));
 	save_item(NAME(m_ready));
+	save_item(NAME(m_wait_states));
+	save_item(NAME(m_wait_count));
 	save_item(NAME(m_eop));
 	save_item(NAME(m_state));
 	save_item(NAME(m_current_channel));
@@ -674,11 +678,14 @@ void am9517a_device::execute_run()
 				dma_write();
 			}
 
-			m_state = m_ready ? STATE_S4 : STATE_SW;
+			m_wait_count = m_wait_states;
+			m_state = (m_ready && !m_wait_count) ? STATE_S4 : STATE_SW;
 			break;
 
 		case STATE_SW:
-			m_state = m_ready ? STATE_S4 : STATE_SW;
+			if (m_wait_count)
+				m_wait_count--;
+			m_state = (m_ready && !m_wait_count) ? STATE_S4 : STATE_SW;
 			break;
 
 		case STATE_S4:

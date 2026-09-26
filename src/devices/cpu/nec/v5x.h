@@ -299,6 +299,20 @@ protected:
 	u8 SCTL_r();
 	void SCTL_w(u8 data);
 
+	// wait control unit and refresh control (V53 register layout)
+	u8 WMB0_r() { return m_WMB0; }
+	void WMB0_w(u8 data) { m_WMB0 = data & 0x77; wcu_update(); }
+	u8 WMB1_r() { return m_WMB1; }
+	void WMB1_w(u8 data) { m_WMB1 = data & 0x77; wcu_update(); }
+	u8 WAC_r() { return m_WAC; }
+	void WAC_w(u8 data) { m_WAC = data & 0x0f; wcu_update(); }
+	template <unsigned N> u8 WCY_r() { return m_WCY[N]; }
+	template <unsigned N> void WCY_w(u8 data) { m_WCY[N] = data & (N ? 0x77 : 0x07); wcu_update(); }
+	u8 RFC_r() { return m_RFC; }
+	void RFC_w(u8 data) { m_RFC = data & 0xdf; wcu_update(); }
+	void wcu_update();
+	void external_io_wait(offs_t a, bool word);
+
 	void tout1_w(int state);
 
 	virtual void sint_w(int state) override;
@@ -306,6 +320,8 @@ protected:
 private:
 	devcb_write_line m_sint_w, m_tout1_w;
 	u8 m_SCTL;
+	u8 m_WMB0, m_WMB1, m_WAC, m_WCY[5], m_RFC;
+	u8 m_io_waits;
 };
 
 class v53a_device : public v53_device
