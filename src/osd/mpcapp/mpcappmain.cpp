@@ -50,6 +50,7 @@
 
 #if defined(__APPLE__)
 #include <dispatch/dispatch.h>
+#include <pthread/qos.h>
 #endif
 
 
@@ -87,6 +88,20 @@ struct mpc3k
 	// audio ring: interleaved MPC3K_AUDIO_CHANNELS floats per frame
 	std::unique_ptr<float[]> ring;
 	std::atomic<uint64_t> ring_write{ 0 }, ring_read{ 0 };
+	// One label per block in the ring: its first ring position and absolute
+	// frame index. 1024 > RING_FRAMES / 44, so it cannot overflow while the
+	// frames fit. Dropped blocks have no label.
+	struct block_label { uint64_t pos; uint64_t frame; };
+	static constexpr unsigned LABELS = 1024;
+	block_label labels[LABELS]{};
+	std::atomic<uint32_t> label_head{ 0 }, label_tail{ 0 };
+	std::atomic<bool> free_run{ false };
+	std::atomic<bool> skip_stale{ false };      // reader drops what free-running left in the ring
+	bool await_refill = true;                   // reader thread: no underruns before the first full read
+	// back-pressure threshold: grows 1 ms (44 frames) per underrun, up to
+	// 10 ms (SPEC.md 5.3)
+	std::atomic<uint32_t> ring_target{ 132 };
+	uint32_t underruns_seen = 0;                // emulation thread
 #if defined(__APPLE__)
 	dispatch_semaphore_t ring_space = nullptr;
 #endif
@@ -212,15 +227,21 @@ void on_sound(mpc3k &m, const std::map<std::string, std::vector<std::pair<const 
 			ch[c] = it->second[c].first;
 			n = std::min(n, unsigned(it->second[c].second));
 		}
-		const uint64_t first = m.frames.load(std::memory_order_relaxed);
+		// Absolute frame index: the DSP runs at exactly 44 100 Hz from power-on,
+		// so a block ending at emulated time t ends near frame t * 44100. Blocks
+		// follow on from each other; resync only on a jump (start, state load).
+		const uint64_t by_time = (m.time_ns.load(std::memory_order_relaxed) * 441 + 5'000'000) / 10'000'000;
+		uint64_t end = m.frames.load(std::memory_order_relaxed) + n;
+		if (end > by_time + 2 || end + 2 < by_time)
+			end = by_time;
+		const uint64_t first = end >= n ? end - n : 0;
 		if (m.config.audio_tap && n)
 			m.config.audio_tap(m.config.user, ch, n, first);
 
-		// back-pressure: the reader clocks the machine
-		if (!m.config.free_run)
+		auto ring_fill = [&m] { return m.ring_write.load(std::memory_order_relaxed) - m.ring_read.load(std::memory_order_acquire); };
+		auto wait_for_reader = [&m] (auto condition)
 		{
-			while (!m.stop_requested.load(std::memory_order_relaxed)
-					&& m.ring_write.load(std::memory_order_relaxed) - m.ring_read.load(std::memory_order_acquire) > m.config.ring_target_frames)
+			while (!m.stop_requested.load(std::memory_order_relaxed) && !m.free_run.load(std::memory_order_relaxed) && condition())
 			{
 #if defined(__APPLE__)
 				dispatch_semaphore_wait(m.ring_space, dispatch_time(DISPATCH_TIME_NOW, 5'000'000));
@@ -228,14 +249,26 @@ void on_sound(mpc3k &m, const std::map<std::string, std::vector<std::pair<const 
 				std::this_thread::sleep_for(std::chrono::microseconds(200));
 #endif
 			}
+		};
+
+		// back-pressure: the reader clocks the machine
+		const uint32_t underruns = m.underruns.load(std::memory_order_relaxed);
+		if (underruns != m.underruns_seen)
+		{
+			const uint32_t grown = m.ring_target.load(std::memory_order_relaxed) + 44 * (underruns - m.underruns_seen);
+			m.ring_target.store(std::min<uint32_t>(grown, 441), std::memory_order_relaxed);
+			m.underruns_seen = underruns;
 		}
+		const uint32_t target = m.ring_target.load(std::memory_order_relaxed);
+		wait_for_reader([&] { return ring_fill() > target; });
 
 		const uint64_t w = m.ring_write.load(std::memory_order_relaxed);
-		if (w + n - m.ring_read.load(std::memory_order_acquire) > mpc3k::RING_FRAMES)
+		if (n && w + n - m.ring_read.load(std::memory_order_acquire) > mpc3k::RING_FRAMES)
 		{
+			// Ring full (free-running with no reader): drop the block.
 			m.dropped.fetch_add(1, std::memory_order_relaxed);
 		}
-		else
+		else if (n)
 		{
 			for (unsigned i = 0; i < n; i++)
 			{
@@ -243,9 +276,12 @@ void on_sound(mpc3k &m, const std::map<std::string, std::vector<std::pair<const 
 				for (unsigned c = 0; c < MPC3K_AUDIO_CHANNELS; c++)
 					frame[c] = ch[c][i];
 			}
+			const uint32_t head = m.label_head.load(std::memory_order_relaxed);
+			m.labels[head % mpc3k::LABELS] = { w, first };
+			m.label_head.store(head + 1, std::memory_order_release);
 			m.ring_write.store(w + n, std::memory_order_release);
 		}
-		m.frames.store(first + n, std::memory_order_relaxed);
+		m.frames.store(end, std::memory_order_relaxed);
 	}
 
 	service(m);
@@ -450,6 +486,8 @@ extern "C" mpc3k *mpc3k_create(const mpc3k_config *config)
 		return nullptr;
 
 	m->ring = std::make_unique<float[]>(size_t(mpc3k::RING_FRAMES) * MPC3K_AUDIO_CHANNELS);
+	m->free_run.store(config->free_run != 0);
+	m->ring_target.store(m->config.ring_target_frames);
 #if defined(__APPLE__)
 	m->ring_space = dispatch_semaphore_create(0);
 #endif
@@ -479,6 +517,11 @@ extern "C" int mpc3k_start(mpc3k *m)
 
 	m->thread = std::thread([m, args = std::move(args)] () mutable
 	{
+#if defined(__APPLE__)
+		// SPEC.md 5.2: the emulation thread runs at user-interactive QoS (the
+		// app can also join it to the output device's audio workgroup).
+		pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 		m->exit_code = run_frontend(args);
 	});
 	return 0;
@@ -533,13 +576,38 @@ extern "C" int mpc3k_push_event(mpc3k *m, const mpc3k_event *event)
 extern "C" uint64_t mpc3k_time_ns(mpc3k *m) { return m ? m->time_ns.load(std::memory_order_relaxed) : 0; }
 extern "C" uint64_t mpc3k_frames_produced(mpc3k *m) { return m ? m->frames.load(std::memory_order_relaxed) : 0; }
 
-extern "C" size_t mpc3k_audio_read(mpc3k *m, float *out, size_t frames, unsigned channels)
+extern "C" size_t mpc3k_audio_read_at(mpc3k *m, float *out, size_t frames, unsigned channels, uint64_t *first_frame)
 {
 	if (!m || !out || (channels != 2 && channels != MPC3K_AUDIO_CHANNELS))
 		return 0;
-	const uint64_t r = m->ring_read.load(std::memory_order_relaxed);
+	uint64_t r = m->ring_read.load(std::memory_order_relaxed);
+	if (m->skip_stale.exchange(false, std::memory_order_acq_rel))
+	{
+		// Free-running keeps the oldest frames and drops new blocks once the
+		// ring is full: none of it is current. Start from the next block, and
+		// do not count the wait for it as an underrun.
+		r = m->ring_write.load(std::memory_order_acquire);
+		m->await_refill = true;
+	}
 	const uint64_t available = m->ring_write.load(std::memory_order_acquire) - r;
 	const size_t n = size_t(std::min<uint64_t>(available, frames));
+	// The label of the block holding position r (labels are written before
+	// ring_write, so every frame below it has one).
+	uint32_t tail = m->label_tail.load(std::memory_order_relaxed);
+	const uint32_t head = m->label_head.load(std::memory_order_acquire);
+	while (head - tail > 1 && m->labels[(tail + 1) % mpc3k::LABELS].pos <= r)
+		tail++;
+	m->label_tail.store(tail, std::memory_order_release);
+	if (first_frame)
+	{
+		if (head != tail)
+		{
+			const mpc3k::block_label &l = m->labels[tail % mpc3k::LABELS];
+			*first_frame = l.frame + (r - l.pos);
+		}
+		else
+			*first_frame = m->frames.load(std::memory_order_relaxed);
+	}
 	for (size_t i = 0; i < n; i++)
 	{
 		const float *frame = &m->ring[((r + i) & (mpc3k::RING_FRAMES - 1)) * MPC3K_AUDIO_CHANNELS];
@@ -549,9 +617,28 @@ extern "C" size_t mpc3k_audio_read(mpc3k *m, float *out, size_t frames, unsigned
 #if defined(__APPLE__)
 	dispatch_semaphore_signal(m->ring_space);
 #endif
-	if (n < frames && m->frames.load(std::memory_order_relaxed))
+	if (n == frames)
+		m->await_refill = false;
+	else if (!m->await_refill && m->frames.load(std::memory_order_relaxed))
 		m->underruns.fetch_add(1, std::memory_order_relaxed);
 	return n;
+}
+
+extern "C" size_t mpc3k_audio_read(mpc3k *m, float *out, size_t frames, unsigned channels)
+{
+	return mpc3k_audio_read_at(m, out, frames, channels, nullptr);
+}
+
+extern "C" void mpc3k_set_free_run(mpc3k *m, int free_run)
+{
+	if (!m)
+		return;
+	const bool was = m->free_run.exchange(free_run != 0);
+	if (was && !free_run)
+		m->skip_stale.store(true, std::memory_order_release);
+#if defined(__APPLE__)
+	dispatch_semaphore_signal(m->ring_space);
+#endif
 }
 
 extern "C" size_t mpc3k_audio_available(mpc3k *m)

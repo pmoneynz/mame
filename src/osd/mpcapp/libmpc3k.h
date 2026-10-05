@@ -14,9 +14,12 @@
  * Channel n of the individual outs is the DSP output the OS calls n.
  *
  * Pacing: the emulation thread produces audio in blocks of 44 or 45 frames
- * (one per 1 ms sound flush) into a ring. Unless free_run is set, it waits
+ * (one per 1 ms sound flush) into a ring. Unless free-running, it waits
  * while the ring holds more than ring_target_frames, so the consumer of
  * mpc3k_audio_read() (normally the Core Audio callback) clocks the machine.
+ *
+ * Frame indices are absolute: frame n is emulated time n / 44100 s (the DSP
+ * runs at exactly 44 100 Hz from power-on), also after a state load.
  */
 
 #ifndef LIBMPC3K_H
@@ -29,7 +32,7 @@
 extern "C" {
 #endif
 
-#define MPC3K_API_VERSION 1
+#define MPC3K_API_VERSION 2
 
 #define MPC3K_SAMPLE_RATE    44100
 #define MPC3K_AUDIO_CHANNELS 10
@@ -72,7 +75,7 @@ typedef struct mpc3k_config
 	int simm_mb;                /* MB per SIMM in the pair: 0 (default), 1 or 4 */
 	unsigned sound_update_hz;   /* sound flush rate; 0 = 1000 */
 	unsigned ring_target_frames;/* back-pressure threshold; 0 = 132 (3 ms) */
-	int free_run;               /* nonzero: never wait on the ring (tests, offline bounce) */
+	int free_run;               /* nonzero: start free-running (mpc3k_set_free_run) */
 	uint64_t stop_at_ns;        /* nonzero: exit when emulated time reaches it */
 	mpc3k_audio_tap audio_tap;  /* optional */
 	void *user;                 /* passed to audio_tap */
@@ -103,16 +106,26 @@ void mpc3k_destroy(mpc3k *m);
  * counts in mpc3k_late_events(). */
 int mpc3k_push_event(mpc3k *m, const mpc3k_event *event);
 
+/* Free-running (nonzero): never wait on the ring; blocks that do not fit are
+ * dropped (cold boot, tests, offline bounce). Paced (0): the ring reader
+ * clocks the machine. May change at any time; on the switch to paced the
+ * reader's next read skips what free-running left in the ring. */
+void mpc3k_set_free_run(mpc3k *m, int free_run);
+
 /* Emulated time at the last sound flush. */
 uint64_t mpc3k_time_ns(mpc3k *m);
 
-/* Audio frames produced since start (the next frame's index). */
+/* Absolute index of the next frame to be produced (emulated time x 44100). */
 uint64_t mpc3k_frames_produced(mpc3k *m);
 
 /* Read up to `frames` frames, interleaved, `channels` = 2 (main L/R) or 10.
  * Real-time safe: never blocks, never allocates. Returns frames read; the
- * caller fills the rest (silence) and the shortfall counts as an underrun. */
+ * caller fills the rest (silence) and the shortfall counts as an underrun.
+ * _at also stores the absolute index of the first frame read (or that would
+ * have been read) in *first_frame. Frames come out contiguous: after a time
+ * jump the ring is relabelled only once it is empty. */
 size_t mpc3k_audio_read(mpc3k *m, float *out, size_t frames, unsigned channels);
+size_t mpc3k_audio_read_at(mpc3k *m, float *out, size_t frames, unsigned channels, uint64_t *first_frame);
 
 /* Frames waiting in the ring. */
 size_t mpc3k_audio_available(mpc3k *m);
