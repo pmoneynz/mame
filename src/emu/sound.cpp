@@ -2047,6 +2047,8 @@ void sound_manager::streams_update()
 			}
 
 		emulator_info::sound_hook(sound_data);
+		if (m_sound_observer)
+			m_sound_observer(sound_data);
 	}
 
 	for(sound_stream *stream : m_ordered_streams)

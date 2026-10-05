@@ -64,6 +64,8 @@
 #include "wavwrite.h"
 #include "interface/audio.h"
 
+#include <functional>
+#include <map>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -137,6 +139,13 @@ public:
 
 	const typename osd::audio_info &get_osd_info() const { return m_osd_info; }
 	const std::vector<mapping> &get_mappings() const { return m_mappings; }
+
+	// C++ observer of hooked devices' output (devices with set_sound_hook(true)),
+	// called on the emulation thread after each stream flush with the same
+	// data as the Lua sound hook: per device tag, per channel, the samples
+	// produced since the previous flush. A host embedding the core uses it.
+	using sound_observer = std::function<void (const std::map<std::string, std::vector<std::pair<const float *, int>>> &)>;
+	void set_sound_observer(sound_observer observer) { m_sound_observer = std::move(observer); }
 
 	// allocate a new stream
 	sound_stream *stream_alloc(device_t &device, u32 inputs, u32 outputs, u32 sample_rate, stream_update_delegate callback, sound_stream_flags flags);
@@ -355,6 +364,7 @@ private:
 	// internal state
 	running_machine &m_machine;            // reference to the running machine
 	emu_timer *m_update_timer;             // timer that runs the update function
+	sound_observer m_sound_observer;       // host observer of hooked devices
 	attotime m_last_sync_time;
 	std::vector<speaker_info> m_speakers;
 	std::vector<microphone_info> m_microphones;
