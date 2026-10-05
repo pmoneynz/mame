@@ -5,8 +5,9 @@
 --
 --   mpcapp.lua
 --
---   Null OSD for the MPC3000 app library (P0.3 spike): headless, no host
---   video, input or audio. Build with OSD=mpcapp NO_OPENGL=1 USE_BGFX=0.
+--   Headless OSD and C API (libmpc3k.h) of the MPC3000 core library: no
+--   host video, input or audio device. Build with OSD=mpcapp NO_OPENGL=1
+--   NO_USE_PORTAUDIO=1.
 --
 ---------------------------------------------------------------------------
 
@@ -76,9 +77,11 @@ project ("osd_" .. _OPTIONS["osd"])
 		MAME_DIR .. "src/osd/modules/render",
 		MAME_DIR .. "3rdparty",
 		MAME_DIR .. "src/osd/mpcapp",
+		MAME_DIR .. "src/mame",       -- akai/mpc3000_app.h
 	}
 
 	files {
+		MAME_DIR .. "src/osd/mpcapp/libmpc3k.h",
 		MAME_DIR .. "src/osd/mpcapp/mpcappmain.cpp",
 		MAME_DIR .. "src/osd/mpcapp/mpcappcli.cpp",
 		MAME_DIR .. "src/osd/mpcapp/mpcappstubs.cpp",
