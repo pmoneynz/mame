@@ -21,6 +21,8 @@
 #include "video.h"
 
 #include "wavwrite.h"
+
+#include <cstdlib>
 #include "xmlfile.h"
 
 #include "osdepend.h"
@@ -90,7 +92,11 @@ sound_manager::sound_manager(running_machine &machine) :
 
 	// start the periodic update flushing timer
 	m_update_timer = machine.scheduler().timer_alloc(timer_expired_delegate(FUNC(sound_manager::update), this));
-	m_update_timer->adjust(STREAMS_UPDATE_ATTOTIME, 0, STREAMS_UPDATE_ATTOTIME);
+	// P0.2 spike (not for the fork): MPC3K_SOUND_UPDATE_HZ overrides the flush rate.
+	attotime update_period = STREAMS_UPDATE_ATTOTIME;
+	if (const char *hz = std::getenv("MPC3K_SOUND_UPDATE_HZ"); hz && std::atoi(hz) > 0)
+		update_period = attotime::from_hz(std::atoi(hz));
+	m_update_timer->adjust(update_period, 0, update_period);
 
 	// mark the generation as "just starting, waiting for config loading"
 	m_osd_info.m_generation = 0xffff0000;
