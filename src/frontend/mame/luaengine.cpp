@@ -811,6 +811,13 @@ void lua_engine::on_machine_postload()
 
 void lua_engine::on_sound_update(const std::map<std::string, std::vector<std::pair<const float *, int>>> &sound)
 {
+	// Hooked devices may serve a C++ observer only (sound_manager::set_sound_observer):
+	// without a Lua callback, do not copy every sample into tables (each flush
+	// would make garbage, and its collection stalls emulation for milliseconds).
+	sol::object functable = sol().registry()["LUA_ON_SOUND_UPDATE"];
+	if (!functable.is<sol::table>() || functable.as<sol::table>().empty())
+		return;
+
 	auto stable = sol().create_table();
 	for(const auto &e : sound) {
 		auto dtable = sol().create_table();
