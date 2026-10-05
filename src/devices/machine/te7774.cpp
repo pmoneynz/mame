@@ -128,6 +128,16 @@ te7774_channel::te7774_channel(const machine_config &mconfig, const char *tag, d
 void te7774_channel::device_start()
 {
 	m_parent = downcast<te7774_device *>(owner());
+
+	save_item(NAME(m_rx_enabled));
+	save_item(NAME(m_tx_data));
+	save_item(NAME(m_rx_data));
+	save_item(NAME(m_control1));
+	save_item(NAME(m_control2));
+	save_item(NAME(m_control3));
+	save_item(NAME(m_status));
+	save_item(NAME(m_tx_data_in_buffer));
+	save_item(NAME(m_tx_enabled));
 }
 
 void te7774_channel::device_reset()
