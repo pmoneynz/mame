@@ -315,7 +315,8 @@ private:
 	void config_load(config_type cfg_type, config_level cfg_lvl, util::xml::data_node const *parentnode);
 	void config_save(config_type cfg_type, util::xml::data_node *parentnode);
 
-	// periodic sound update, called STREAMS_UPDATE_FREQUENCY per second
+	// periodic sound update, called sound_update_hz times per second
+	// (default STREAMS_UPDATE_FREQUENCY)
 	void update(s32);
 
 	// handle mixing mapping update if needed

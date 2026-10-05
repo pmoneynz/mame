@@ -143,6 +143,7 @@ const options_entry emu_options::s_option_entries[] =
 	// sound options
 	{ nullptr,                                           nullptr,     core_options::option_type::HEADER,     "CORE SOUND OPTIONS" },
 	{ OPTION_SAMPLERATE ";sr(1000-1000000)",             "48000",     core_options::option_type::INTEGER,    "set sound output sample rate" },
+	{ OPTION_SOUND_UPDATE_HZ "(1-10000)",                "50",        core_options::option_type::INTEGER,    "rate at which sound streams are flushed to the output, in Hz" },
 	{ OPTION_SAMPLES,                                    "1",         core_options::option_type::BOOLEAN,    "enable the use of external samples if available" },
 	{ OPTION_VOLUME ";vol(-96-12)",                      "0",         core_options::option_type::INTEGER,    "sound volume in decibels" },
 

@@ -123,6 +123,7 @@
 
 // core sound options
 #define OPTION_SAMPLERATE           "samplerate"
+#define OPTION_SOUND_UPDATE_HZ      "sound_update_hz"
 #define OPTION_SAMPLES              "samples"
 #define OPTION_VOLUME               "volume"
 
@@ -408,6 +409,7 @@ public:
 
 	// core sound options
 	int sample_rate() const { return int_value(OPTION_SAMPLERATE); }
+	int sound_update_hz() const { return int_value(OPTION_SOUND_UPDATE_HZ); }
 	bool samples() const { return bool_value(OPTION_SAMPLES); }
 	int volume() const { return int_value(OPTION_VOLUME); }
 

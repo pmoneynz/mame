@@ -90,7 +90,9 @@ sound_manager::sound_manager(running_machine &machine) :
 
 	// start the periodic update flushing timer
 	m_update_timer = machine.scheduler().timer_alloc(timer_expired_delegate(FUNC(sound_manager::update), this));
-	m_update_timer->adjust(STREAMS_UPDATE_ATTOTIME, 0, STREAMS_UPDATE_ATTOTIME);
+	const int update_hz = machine.options().sound_update_hz();
+	const attotime update_period = (update_hz > 0) ? attotime::from_hz(update_hz) : STREAMS_UPDATE_ATTOTIME;
+	m_update_timer->adjust(update_period, 0, update_period);
 
 	// mark the generation as "just starting, waiting for config loading"
 	m_osd_info.m_generation = 0xffff0000;
