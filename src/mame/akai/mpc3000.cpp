@@ -302,9 +302,19 @@ void mpc3000_state::machine_reset()
 		m_hle_dial = m_dataentry->read() & 0xff;
 		m_hle_variation = m_variation->read() * 0x7f / 100;
 		m_hle_scan_timer->adjust(attotime::from_msec(1), 0, attotime::from_msec(1));
+
+		// The HLE stands in for the panel MCU: hold the uPD78C10 (its ROM is
+		// not dumped, and a placeholder would only burn host time) and idle
+		// its TxD high so it cannot pull the wired-AND link low.
+		m_subcpu->suspend(SUSPEND_REASON_DISABLE, true);
+		m_subcpu_txd = 1;
+		panel_rx_update();
 	}
 	else
+	{
 		m_hle_scan_timer->enable(false);
+		m_subcpu->resume(SUSPEND_REASON_DISABLE);
+	}
 }
 
 // The sizing routine at D0C0:0100 (linear 0x50D00) probes each 2 MB bank
