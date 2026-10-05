@@ -109,6 +109,8 @@ MPCs on other hardware:
 #include "formats/pc_dsk.h"
 #include "formats/ipf_dsk.h"
 
+#include "mpc3000_app.h"
+
 #include "mpc3000.lh"
 
 namespace {
@@ -116,7 +118,7 @@ namespace {
 static constexpr uint8_t BIT4 = (1 << 4);
 static constexpr uint8_t BIT5 = (1 << 5);
 
-class mpc3000_state : public driver_device
+class mpc3000_state : public driver_device, public mpc3000_app_interface
 {
 public:
 	mpc3000_state(const machine_config &mconfig, device_type type, const char *tag)
@@ -128,6 +130,8 @@ public:
 		, m_fdc(*this, "fdc")
 		, m_floppy(*this, "fdc:0")
 		, m_sio(*this, "sio")
+		, m_loled(*this, "loledlatch")
+		, m_hiled(*this, "hiledlatch")
 		, m_keys(*this, "Y%u", 0)
 		, m_drums(*this, "PB%u", 0)
 		, m_dataentry(*this, "DATAENTRY")
@@ -147,6 +151,11 @@ public:
 
 	DECLARE_INPUT_CHANGED_MEMBER(variation_changed);
 
+	// mpc3000_app_interface
+	virtual bool app_event(const attotime &when, uint8_t kind, uint8_t code, uint8_t value) override;
+	virtual uint32_t app_late_events() const override { return m_app_late; }
+	virtual uint16_t app_leds() const override;
+
 private:
 	required_device<v53a_device> m_maincpu;
 	required_device<upd7810_device> m_subcpu;
@@ -155,6 +164,8 @@ private:
 	required_device<upd72069_device> m_fdc;
 	required_device<floppy_connector> m_floppy;
 	required_device<te7774_device> m_sio;
+	required_device<hc259_device> m_loled;
+	required_device<hc259_device> m_hiled;
 	required_ioport_array<8> m_keys;
 	required_ioport_array<4> m_drums;
 	required_ioport m_dataentry;
@@ -189,6 +200,19 @@ private:
 	void hle_send(uint8_t a, uint8_t b, uint8_t c);
 	TIMER_CALLBACK_MEMBER(hle_scan);
 	TIMER_CALLBACK_MEMBER(hle_bit);
+
+	// App event port (mpc3000_app.h): time-ordered, fixed size, saved.
+	emu_timer *m_app_timer;
+	int32_t m_app_secs[EVENT_QUEUE_SIZE];
+	int64_t m_app_attos[EVENT_QUEUE_SIZE];
+	uint8_t m_app_kind[EVENT_QUEUE_SIZE], m_app_code[EVENT_QUEUE_SIZE], m_app_value[EVENT_QUEUE_SIZE];
+	uint16_t m_app_count;
+	uint32_t m_app_late;
+	uint8_t m_footswitch;        // HC365 bits 3-4, line levels from EVENT_FOOTSWITCH
+	attotime app_time(unsigned i) const { return attotime(m_app_secs[i], m_app_attos[i]); }
+	void app_arm();
+	void app_dispatch(uint8_t kind, uint8_t code, uint8_t value);
+	TIMER_CALLBACK_MEMBER(app_fire);
 
 	static void floppies(device_slot_interface &device);
 
@@ -268,6 +292,19 @@ void mpc3000_state::machine_start()
 	machine().save().register_postload(save_prepost_delegate(FUNC(mpc3000_state::wave_decode), this));
 	m_smpte_bus = 0;
 	save_item(NAME(m_smpte_bus));
+
+	m_app_timer = timer_alloc(FUNC(mpc3000_state::app_fire), this);
+	m_app_count = 0;
+	m_app_late = 0;
+	m_footswitch = 0;
+	save_item(NAME(m_app_secs));
+	save_item(NAME(m_app_attos));
+	save_item(NAME(m_app_kind));
+	save_item(NAME(m_app_code));
+	save_item(NAME(m_app_value));
+	save_item(NAME(m_app_count));
+	save_item(NAME(m_app_late));
+	save_item(NAME(m_footswitch));
 }
 
 void mpc3000_state::machine_reset()
@@ -292,6 +329,9 @@ void mpc3000_state::machine_reset()
 	m_hle_head = m_hle_tail = 0;
 	m_hle_bits = 0;
 	m_hle_txd = 1;
+	m_app_count = 0;
+	m_app_late = 0;
+	m_app_timer->enable(false);
 	m_hle_bit_timer->enable(false);
 	if (!BIT(cfg, 6))
 	{
@@ -457,6 +497,115 @@ TIMER_CALLBACK_MEMBER(mpc3000_state::hle_bit)
 	panel_rx_update();
 }
 
+// App event port. Events are kept sorted by time (stable for equal times);
+// m_app_timer fires at the head event. Pads and keys become the frames the
+// panel would send, through the HLE FIFO, so they share its 31 250 baud
+// serialiser: simultaneous hits arrive spaced by the link like the panel's.
+bool mpc3000_state::app_event(const attotime &when, uint8_t kind, uint8_t code, uint8_t value)
+{
+	switch (kind)
+	{
+	case EVENT_KEY:         if (code < 0x40 || code > 0x79) return false; break;
+	case EVENT_PAD:
+	case EVENT_PRESSURE:    if (code < 1 || code > 16) return false; break;
+	case EVENT_SLIDER:
+	case EVENT_DIAL:        break;
+	case EVENT_FOOTSWITCH:  if (code < 1 || code > 2) return false; break;
+	default:                return false;
+	}
+	if (m_app_count == EVENT_QUEUE_SIZE)
+		return false;
+
+	unsigned pos = m_app_count;
+	while (pos > 0 && app_time(pos - 1) > when)
+	{
+		m_app_secs[pos] = m_app_secs[pos - 1];
+		m_app_attos[pos] = m_app_attos[pos - 1];
+		m_app_kind[pos] = m_app_kind[pos - 1];
+		m_app_code[pos] = m_app_code[pos - 1];
+		m_app_value[pos] = m_app_value[pos - 1];
+		pos--;
+	}
+	m_app_secs[pos] = when.seconds();
+	m_app_attos[pos] = when.attoseconds();
+	m_app_kind[pos] = kind;
+	m_app_code[pos] = code;
+	m_app_value[pos] = value;
+	m_app_count++;
+	if (when < machine().time())
+		m_app_late++;
+	app_arm();
+	return true;
+}
+
+void mpc3000_state::app_arm()
+{
+	if (!m_app_count)
+	{
+		m_app_timer->enable(false);
+		return;
+	}
+	const attotime now = machine().time();
+	const attotime head = app_time(0);
+	m_app_timer->adjust(head > now ? head - now : attotime::zero);
+}
+
+TIMER_CALLBACK_MEMBER(mpc3000_state::app_fire)
+{
+	const attotime now = machine().time();
+	unsigned n = 0;
+	while (n < m_app_count && app_time(n) <= now)
+	{
+		app_dispatch(m_app_kind[n], m_app_code[n], m_app_value[n]);
+		n++;
+	}
+	for (unsigned i = n; i < m_app_count; i++)
+	{
+		m_app_secs[i - n] = m_app_secs[i];
+		m_app_attos[i - n] = m_app_attos[i];
+		m_app_kind[i - n] = m_app_kind[i];
+		m_app_code[i - n] = m_app_code[i];
+		m_app_value[i - n] = m_app_value[i];
+	}
+	m_app_count -= n;
+	app_arm();
+}
+
+void mpc3000_state::app_dispatch(uint8_t kind, uint8_t code, uint8_t value)
+{
+	switch (kind)
+	{
+	case EVENT_KEY:
+		hle_send(0x90, code, value ? 0x7f : 0x00);
+		break;
+	case EVENT_PAD:         // raw pad r = (pad - 1) ^ 0x0c (OS table CS:0057)
+		hle_send(0x90, (code - 1) ^ 0x0c, std::min<uint8_t>(value, 0x7f));
+		break;
+	case EVENT_PRESSURE:
+		hle_send(0xa0, (code - 1) ^ 0x0c, std::min<uint8_t>(value, 0x7f));
+		break;
+	case EVENT_SLIDER:
+		hle_send(0xb0, 0x00, std::min<uint8_t>(value, 0x7f));
+		break;
+	case EVENT_DIAL:
+		for (int steps = int8_t(value); steps; steps += steps > 0 ? -1 : 1)
+			hle_send(0xe0, steps > 0 ? 0x00 : 0x7f, steps > 0 ? 0x00 : 0x7f);
+		break;
+	case EVENT_FOOTSWITCH:  // HC365 bit 3 or 4; which switch is which is unknown
+		if (value)
+			m_footswitch |= 1 << (code + 2);
+		else
+			m_footswitch &= ~(1 << (code + 2));
+		break;
+	}
+}
+
+uint16_t mpc3000_state::app_leds() const
+{
+	// The latch outputs drive the LEDs inverted (see the HC259 wiring).
+	return ~(m_loled->output_state() | (m_hiled->output_state() << 8)) & 0xffff;
+}
+
 // I/O 0x50 is the I-0055 SMPTE option (IC26 socket). The OS probe at
 // linear 0x56BEA writes 0x0000 then 0xFFFF and treats a read-back of the
 // written value as "not installed". Without the chip the undriven bus is
@@ -507,7 +656,7 @@ void mpc3000_state::mpc3000_io_map(address_map &map)
 uint8_t mpc3000_state::fdc_hc365_r()
 {
 	const auto imagedev = m_floppy->get_device();
-	return (imagedev->floppy_is_hd() ? 0x04 : 0x00) | imagedev->dskchg_r();
+	return (imagedev->floppy_is_hd() ? 0x04 : 0x00) | imagedev->dskchg_r() | m_footswitch;
 }
 
 uint16_t mpc3000_state::dma_mem16r_cb(offs_t offset)
