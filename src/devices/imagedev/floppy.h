@@ -128,6 +128,12 @@ public:
 	bool trk00_r() { return (m_has_trk00_sensor ? (m_cyl != 0) : 1); }
 	int idx_r() { return m_idx; }
 	int mon_r() { return m_mon; }
+
+	// Unsaved writes, and writing them back to the image file now (a host
+	// that syncs the image with something else does this while the drive
+	// is idle rather than waiting for unload).
+	bool is_dirty() const { return m_image_dirty; }
+	void flush() { if (m_image_dirty) commit_image(); }
 	bool ss_r() { return m_ss; }
 	bool twosid_r();
 	bool floppy_is_hd();
