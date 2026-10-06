@@ -32,7 +32,7 @@
 extern "C" {
 #endif
 
-#define MPC3K_API_VERSION 3
+#define MPC3K_API_VERSION 4
 
 #define MPC3K_SAMPLE_RATE    44100
 #define MPC3K_AUDIO_CHANNELS 10
@@ -142,6 +142,9 @@ uint16_t mpc3k_leds(mpc3k *m);
 /* Counters: events that fired late, underruns (reads that came up short
  * after the first block), blocks dropped because the ring was full. */
 uint32_t mpc3k_late_events(mpc3k *m);
+/* The back-pressure threshold now, in frames: ring_target_frames, plus 44
+ * (1 ms) per underrun up to 441 (10 ms), minus 44 per 5 s without one. */
+uint32_t mpc3k_ring_target(mpc3k *m);
 uint32_t mpc3k_underruns(mpc3k *m);
 uint32_t mpc3k_dropped_blocks(mpc3k *m);
 

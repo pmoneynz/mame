@@ -100,9 +100,12 @@ struct mpc3k
 	std::atomic<bool> skip_stale{ false };      // reader drops what free-running left in the ring
 	bool await_refill = true;                   // reader thread: no underruns before the first full read
 	// back-pressure threshold: grows 1 ms (44 frames) per underrun, up to
-	// 10 ms (SPEC.md 5.3)
+	// 10 ms (SPEC.md 5.3), and shrinks 1 ms per 5 s without one, down to the
+	// configured base, so a burst (say, a disk load on a busy host) does not
+	// leave the extra latency for the rest of the session
 	std::atomic<uint32_t> ring_target{ 132 };
 	uint32_t underruns_seen = 0;                // emulation thread
+	attotime quiet_since = attotime::zero;      // emulation thread
 #if defined(__APPLE__)
 	dispatch_semaphore_t ring_space = nullptr;
 #endif
@@ -259,11 +262,20 @@ void on_sound(mpc3k &m, const std::map<std::string, std::vector<std::pair<const 
 
 		// back-pressure: the reader clocks the machine
 		const uint32_t underruns = m.underruns.load(std::memory_order_relaxed);
+		const attotime now = m.machine->time();
 		if (underruns != m.underruns_seen)
 		{
 			const uint32_t grown = m.ring_target.load(std::memory_order_relaxed) + 44 * (underruns - m.underruns_seen);
 			m.ring_target.store(std::min<uint32_t>(grown, 441), std::memory_order_relaxed);
 			m.underruns_seen = underruns;
+			m.quiet_since = now;
+		}
+		else if (now - m.quiet_since >= attotime::from_seconds(5))
+		{
+			const uint32_t current = m.ring_target.load(std::memory_order_relaxed);
+			if (current > m.config.ring_target_frames)
+				m.ring_target.store(std::max<uint32_t>(current - 44, m.config.ring_target_frames), std::memory_order_relaxed);
+			m.quiet_since = now;
 		}
 		const uint32_t target = m.ring_target.load(std::memory_order_relaxed);
 		wait_for_reader([&] { return ring_fill() > target; });
@@ -699,6 +711,7 @@ extern "C" uint64_t mpc3k_lcd(mpc3k *m, uint8_t *pixels)
 extern "C" uint16_t mpc3k_leds(mpc3k *m) { return m ? m->leds.load(std::memory_order_relaxed) : 0; }
 extern "C" uint32_t mpc3k_late_events(mpc3k *m) { return m ? m->late.load(std::memory_order_relaxed) : 0; }
 extern "C" uint32_t mpc3k_underruns(mpc3k *m) { return m ? m->underruns.load(std::memory_order_relaxed) : 0; }
+extern "C" uint32_t mpc3k_ring_target(mpc3k *m) { return m ? m->ring_target.load(std::memory_order_relaxed) : 0; }
 extern "C" uint32_t mpc3k_floppy_writebacks(mpc3k *m) { return m ? m->floppy_writebacks.load(std::memory_order_acquire) : 0; }
 extern "C" int mpc3k_floppy_busy(mpc3k *m) { return m ? m->floppy_busy.load(std::memory_order_relaxed) : 0; }
 extern "C" uint32_t mpc3k_dropped_blocks(mpc3k *m) { return m ? m->dropped.load(std::memory_order_relaxed) : 0; }
