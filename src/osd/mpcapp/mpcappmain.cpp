@@ -131,6 +131,12 @@ struct mpc3k
 	// emulation thread only
 	running_machine *machine = nullptr;
 	mpc3000_app_interface *app = nullptr;
+
+	// MIDI OUT bytes (emulation thread writes, the app reads)
+	static constexpr uint32_t MIDI_OUT_QUEUE = 8192;
+	mpc3k_midi_byte midi_out[MIDI_OUT_QUEUE];
+	std::atomic<uint32_t> midi_out_head{ 0 }, midi_out_tail{ 0 };
+	std::atomic<uint32_t> midi_out_dropped{ 0 };
 	bool ready = false;             // devices started (first reset seen)
 	floppy_image_device *floppy_device = nullptr;
 	attotime floppy_idle_since = attotime::never;
@@ -163,6 +169,7 @@ bool valid_event(const mpc3k_event &e)
 	case MPC3K_EVENT_SLIDER:     return e.value >= 0 && e.value <= 127;
 	case MPC3K_EVENT_DIAL:       return e.value >= -128 && e.value <= 127;
 	case MPC3K_EVENT_FOOTSWITCH: return e.code >= 1 && e.code <= 2;
+	case MPC3K_EVENT_MIDI_IN:    return e.code >= 1 && e.code <= 2 && e.value >= 0 && e.value <= 255;
 	default:                     return false;
 	}
 }
@@ -416,6 +423,18 @@ public:
 		{
 			m->machine = &machine;
 			m->app = dynamic_cast<mpc3000_app_interface *>(&machine.root_device());
+			if (m->app)
+				m->app->app_set_midi_out([m] (const attotime &when, uint8_t port, uint8_t byte)
+				{
+					const uint32_t tail = m->midi_out_tail.load(std::memory_order_relaxed);
+					if (tail - m->midi_out_head.load(std::memory_order_acquire) >= mpc3k::MIDI_OUT_QUEUE)
+					{
+						m->midi_out_dropped.fetch_add(1, std::memory_order_relaxed);
+						return;
+					}
+					m->midi_out[tail % mpc3k::MIDI_OUT_QUEUE] = { attotime_to_ns(when), port, byte };
+					m->midi_out_tail.store(tail + 1, std::memory_order_release);
+				});
 			m->exit_scheduled = false;
 			m->ready = false;
 			// The sound manager is created after the OSD; hook it at reset.
@@ -453,6 +472,8 @@ public:
 		{
 			g_machine->machine->sound().set_sound_observer(nullptr);
 			g_machine->machine = nullptr;
+			if (g_machine->app)
+				g_machine->app->app_set_midi_out(nullptr);
 			g_machine->app = nullptr;
 			g_machine->floppy_device = nullptr;
 			g_machine->ready = false;
@@ -657,6 +678,21 @@ extern "C" int mpc3k_push_event(mpc3k *m, const mpc3k_event *event)
 	m->event_tail.store(tail + 1, std::memory_order_release);
 	return 0;
 }
+
+extern "C" size_t mpc3k_midi_out_read(mpc3k *m, mpc3k_midi_byte *out, size_t max)
+{
+	if (!m || !out)
+		return 0;
+	uint32_t head = m->midi_out_head.load(std::memory_order_relaxed);
+	const uint32_t tail = m->midi_out_tail.load(std::memory_order_acquire);
+	size_t n = 0;
+	while (head != tail && n < max)
+		out[n++] = m->midi_out[head++ % mpc3k::MIDI_OUT_QUEUE];
+	m->midi_out_head.store(head, std::memory_order_release);
+	return n;
+}
+
+extern "C" uint32_t mpc3k_midi_out_dropped(mpc3k *m) { return m ? m->midi_out_dropped.load(std::memory_order_relaxed) : 0; }
 
 extern "C" uint64_t mpc3k_time_ns(mpc3k *m) { return m ? m->time_ns.load(std::memory_order_relaxed) : 0; }
 extern "C" uint64_t mpc3k_frames_produced(mpc3k *m) { return m ? m->frames.load(std::memory_order_relaxed) : 0; }

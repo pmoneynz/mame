@@ -34,6 +34,8 @@ public:
 
 	void set_channel(int ch) { m_ch = ch; }
 
+	void update_tx_ready();
+
 private:
 	// receiver state
 	bool m_rx_enabled;
@@ -62,6 +64,8 @@ public:
 	template <int ch> auto rxrdy_handler() { return m_rxrdy_handler[ch].bind(); }
 	template <int ch> auto txrdy_handler() { return m_txrdy_handler[ch].bind(); }
 	template <int ch> auto txd_handler() { return m_txd_handler[ch].bind(); }
+	// a byte entering the transmitter (its start bit begins now)
+	template <int ch> auto txbyte_handler() { return m_txbyte_handler[ch].bind(); }
 
 	template <int ch> void rx_w(int state);
 
@@ -76,6 +80,7 @@ protected:
 
 	devcb_write_line m_rxrdy_handler[4], m_txrdy_handler[4];
 	devcb_write_line m_txd_handler[4];
+	devcb_write8 m_txbyte_handler[4];
 
 private:
 	required_device_array<te7774_channel, 4> m_channels;

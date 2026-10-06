@@ -155,6 +155,7 @@ public:
 	virtual bool app_event(const attotime &when, uint8_t kind, uint8_t code, uint8_t value) override;
 	virtual uint32_t app_late_events() const override { return m_app_late; }
 	virtual uint16_t app_leds() const override;
+	virtual void app_set_midi_out(midi_out_sink sink) override { m_midi_out_sink = std::move(sink); }
 
 private:
 	required_device<v53a_device> m_maincpu;
@@ -200,6 +201,23 @@ private:
 	void hle_send(uint8_t a, uint8_t b, uint8_t c);
 	TIMER_CALLBACK_MEMBER(hle_scan);
 	TIMER_CALLBACK_MEMBER(hle_bit);
+
+	// MIDI IN 1/2 from the app (EVENT_MIDI_IN): a 31 250 baud serialiser
+	// per port, wire-ANDed with the MIDI_PORT's own line (idle high).
+	emu_timer *m_midi_in_timer[2];
+	uint8_t m_midi_in_fifo[2][256];
+	uint8_t m_midi_in_head[2], m_midi_in_tail[2];
+	uint16_t m_midi_in_frame[2];
+	uint8_t m_midi_in_bits[2];
+	int m_midi_in_txd[2], m_midi_port_rxd[2];
+	template <int Port> void midi_port_rxd_w(int state);
+	void midi_in_update(int port);
+	void midi_in_send(int port, uint8_t byte);
+	TIMER_CALLBACK_MEMBER(midi_in_bit);
+
+	// MIDI OUT 1-4 to the app.
+	midi_out_sink m_midi_out_sink;
+	template <int Port> void midi_out_byte(uint8_t data);
 
 	// App event port (mpc3000_app.h): time-ordered, fixed size, saved.
 	emu_timer *m_app_timer;
@@ -293,6 +311,22 @@ void mpc3000_state::machine_start()
 	m_smpte_bus = 0;
 	save_item(NAME(m_smpte_bus));
 
+	for (int p = 0; p < 2; p++)
+	{
+		m_midi_in_timer[p] = timer_alloc(FUNC(mpc3000_state::midi_in_bit), this);
+		m_midi_in_head[p] = m_midi_in_tail[p] = 0;
+		m_midi_in_frame[p] = 0;
+		m_midi_in_bits[p] = 0;
+		m_midi_in_txd[p] = m_midi_port_rxd[p] = 1;
+	}
+	save_item(NAME(m_midi_in_fifo));
+	save_item(NAME(m_midi_in_head));
+	save_item(NAME(m_midi_in_tail));
+	save_item(NAME(m_midi_in_frame));
+	save_item(NAME(m_midi_in_bits));
+	save_item(NAME(m_midi_in_txd));
+	save_item(NAME(m_midi_port_rxd));
+
 	m_app_timer = timer_alloc(FUNC(mpc3000_state::app_fire), this);
 	m_app_count = 0;
 	m_app_late = 0;
@@ -333,6 +367,14 @@ void mpc3000_state::machine_reset()
 	m_app_late = 0;
 	m_app_timer->enable(false);
 	m_hle_bit_timer->enable(false);
+	for (int p = 0; p < 2; p++)
+	{
+		m_midi_in_timer[p]->enable(false);
+		m_midi_in_head[p] = m_midi_in_tail[p] = 0;
+		m_midi_in_bits[p] = 0;
+		m_midi_in_txd[p] = 1;
+		midi_in_update(p);
+	}
 	if (!BIT(cfg, 6))
 	{
 		for (int row = 0; row < 8; row++)
@@ -510,7 +552,8 @@ bool mpc3000_state::app_event(const attotime &when, uint8_t kind, uint8_t code, 
 	case EVENT_PRESSURE:    if (code < 1 || code > 16) return false; break;
 	case EVENT_SLIDER:
 	case EVENT_DIAL:        break;
-	case EVENT_FOOTSWITCH:  if (code < 1 || code > 2) return false; break;
+	case EVENT_FOOTSWITCH:
+	case EVENT_MIDI_IN:     if (code < 1 || code > 2) return false; break;
 	default:                return false;
 	}
 	if (m_app_count == EVENT_QUEUE_SIZE)
@@ -597,7 +640,64 @@ void mpc3000_state::app_dispatch(uint8_t kind, uint8_t code, uint8_t value)
 		else
 			m_footswitch &= ~(1 << (code + 2));
 		break;
+	case EVENT_MIDI_IN:
+		midi_in_send(code - 1, value);
+		break;
 	}
+}
+
+// MIDI IN from the app: the same framing as the panel HLE (start bit, 8
+// data bits LSB first, stop bit), one serialiser per port so bytes keep
+// the line's real spacing (320 us each).
+template <int Port>
+void mpc3000_state::midi_port_rxd_w(int state)
+{
+	m_midi_port_rxd[Port] = state;
+	midi_in_update(Port);
+}
+
+void mpc3000_state::midi_in_update(int port)
+{
+	const int line = m_midi_port_rxd[port] & m_midi_in_txd[port];
+	if (port == 0)
+		m_sio->rx_w<0>(line);
+	else
+		m_sio->rx_w<1>(line);
+}
+
+void mpc3000_state::midi_in_send(int port, uint8_t byte)
+{
+	if (uint8_t(m_midi_in_tail[port] + 1) == m_midi_in_head[port])
+		return;
+	m_midi_in_fifo[port][m_midi_in_tail[port]++] = byte;
+	if (!m_midi_in_timer[port]->enabled())
+		m_midi_in_timer[port]->adjust(attotime::zero, port, attotime::from_hz(31250));
+}
+
+TIMER_CALLBACK_MEMBER(mpc3000_state::midi_in_bit)
+{
+	const int port = param;
+	if (!m_midi_in_bits[port])
+	{
+		if (m_midi_in_head[port] == m_midi_in_tail[port])
+		{
+			m_midi_in_timer[port]->enable(false);
+			return;
+		}
+		m_midi_in_frame[port] = (m_midi_in_fifo[port][m_midi_in_head[port]++] << 1) | 0x200;
+		m_midi_in_bits[port] = 10;
+	}
+	m_midi_in_txd[port] = m_midi_in_frame[port] & 1;
+	m_midi_in_frame[port] >>= 1;
+	m_midi_in_bits[port]--;
+	midi_in_update(port);
+}
+
+template <int Port>
+void mpc3000_state::midi_out_byte(uint8_t data)
+{
+	if (m_midi_out_sink)
+		m_midi_out_sink(machine().time(), Port + 1, data);
 }
 
 uint16_t mpc3000_state::app_leds() const
@@ -945,6 +1045,10 @@ void mpc3000_state::mpc3000(machine_config &config)
 	m_sio->txd_handler<1>().set("mdout2", FUNC(midi_port_device::write_txd));
 	m_sio->txd_handler<2>().set("mdout3", FUNC(midi_port_device::write_txd));
 	m_sio->txd_handler<3>().set("mdout4", FUNC(midi_port_device::write_txd));
+	m_sio->txbyte_handler<0>().set(FUNC(mpc3000_state::midi_out_byte<0>));
+	m_sio->txbyte_handler<1>().set(FUNC(mpc3000_state::midi_out_byte<1>));
+	m_sio->txbyte_handler<2>().set(FUNC(mpc3000_state::midi_out_byte<2>));
+	m_sio->txbyte_handler<3>().set(FUNC(mpc3000_state::midi_out_byte<3>));
 	m_sio->rxrdy_handler<0>().set("intp5", FUNC(input_merger_device::in_w<0>));
 	m_sio->rxrdy_handler<1>().set("intp5", FUNC(input_merger_device::in_w<1>));
 	m_sio->rxrdy_handler<2>().set("intp5", FUNC(input_merger_device::in_w<2>));
@@ -956,11 +1060,11 @@ void mpc3000_state::mpc3000(machine_config &config)
 
 	auto &mdin(MIDI_PORT(config, "mdin"));
 	midiin_slot(mdin);
-	mdin.rxd_handler().set(m_sio, FUNC(te7774_device::rx_w<0>));
+	mdin.rxd_handler().set(FUNC(mpc3000_state::midi_port_rxd_w<0>));
 
 	auto &mdin2(MIDI_PORT(config, "mdin2"));
 	midiin_slot(mdin2);
-	mdin2.rxd_handler().set(m_sio, FUNC(te7774_device::rx_w<1>));
+	mdin2.rxd_handler().set(FUNC(mpc3000_state::midi_port_rxd_w<1>));
 
 	auto &panel(MIDI_PORT(config, "panel"));
 	midiin_slot(panel);

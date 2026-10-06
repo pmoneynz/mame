@@ -32,7 +32,7 @@
 extern "C" {
 #endif
 
-#define MPC3K_API_VERSION 5
+#define MPC3K_API_VERSION 6
 
 #define MPC3K_SAMPLE_RATE    44100
 #define MPC3K_AUDIO_CHANNELS 10
@@ -41,7 +41,7 @@ extern "C" {
 
 typedef struct mpc3k mpc3k;
 
-/* Front-panel events (driver: src/mame/akai/mpc3000_app.h). */
+/* Front-panel and MIDI IN events (driver: src/mame/akai/mpc3000_app.h). */
 enum mpc3k_event_kind
 {
 	MPC3K_EVENT_KEY = 1,        /* code: panel key code 0x40..0x79; value: 1 press, 0 release */
@@ -49,8 +49,19 @@ enum mpc3k_event_kind
 	MPC3K_EVENT_PRESSURE = 3,   /* code: pad 1..16; value: 0..127 */
 	MPC3K_EVENT_SLIDER = 4,     /* value: 0..127 */
 	MPC3K_EVENT_DIAL = 5,       /* value: signed steps -128..127, + is clockwise */
-	MPC3K_EVENT_FOOTSWITCH = 6  /* code: 1 or 2; value: line level 0/1 (polarity unknown) */
+	MPC3K_EVENT_FOOTSWITCH = 6, /* code: 1 or 2; value: line level 0/1 (polarity unknown) */
+	MPC3K_EVENT_MIDI_IN = 7     /* code: MIDI IN 1 or 2; value: one byte 0..255. Bytes on a port
+	                               leave at 31 250 baud, one after another (320 us each) */
 };
+
+/* A byte on MIDI OUT 1-4: time_ns is the emulated time its start bit
+ * leaves the UART. */
+typedef struct mpc3k_midi_byte
+{
+	uint64_t time_ns;
+	uint8_t port;               /* 1..4 */
+	uint8_t byte;
+} mpc3k_midi_byte;
 
 typedef struct mpc3k_event
 {
@@ -105,6 +116,12 @@ void mpc3k_destroy(mpc3k *m);
  * the event at time_ns; an event whose time has passed fires at once and
  * counts in mpc3k_late_events(). */
 int mpc3k_push_event(mpc3k *m, const mpc3k_event *event);
+
+/* MIDI OUT bytes since the last call, oldest first, up to max. Single
+ * reader. The core keeps 8192; when the reader falls behind, newer bytes
+ * are dropped and counted. */
+size_t mpc3k_midi_out_read(mpc3k *m, mpc3k_midi_byte *out, size_t max);
+uint32_t mpc3k_midi_out_dropped(mpc3k *m);
 
 /* Free-running (nonzero): never wait on the ring; blocks that do not fit are
  * dropped (cold boot, tests, offline bounce). Paced (0): the ring reader

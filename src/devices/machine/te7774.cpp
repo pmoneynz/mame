@@ -20,6 +20,14 @@
  * 00 to control 3
  *
  * Because of the mapping we can assume channel 4 doesn't want Rx enabled since channel 3 already takes care of it.
+ *
+ * Control 3 (HYPOTHESIS, MPC3000 OS behaviour): bit 1 enables the TxRdy
+ * interrupt, bit 2 the RxRdy one. Init writes 04 to the receiving
+ * channels and 00 to channel 4; to send, the OS writes 06 and waits for
+ * the TxRdy interrupt, then writes the byte, and writes 04 when its queue
+ * is empty. TxRdy (status bit 0) is set while the transmitter is enabled
+ * and holds no byte, so an idle enabled channel is ready at once. The
+ * TxRdy line is gated by control 3 bit 1; RxRdy stays ungated as before.
  */
 
 #include "emu.h"
@@ -41,6 +49,7 @@ te7774_device::te7774_device(const machine_config &mconfig, const char *tag, dev
 	, m_rxrdy_handler{{*this}, {*this}, {*this}, {*this}}
 	, m_txrdy_handler{{*this}, {*this}, {*this}, {*this}}
 	, m_txd_handler{{*this}, {*this}, {*this}, {*this}}
+	, m_txbyte_handler{{*this}, {*this}, {*this}, {*this}}
 	, m_channels(*this, "ch%u", 0U)
 	, m_rxd_handler{{*this, 0xff}, {*this, 0xff}, {*this, 0xff}, {*this, 0xff}}
 {
@@ -111,6 +120,11 @@ enum
 	CONTROL1_RxEnable = 0x04
 };
 
+enum
+{
+	CONTROL3_TxIntEnable = 0x02
+};
+
 te7774_channel::te7774_channel(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
 	: device_t(mconfig, TE7774_CHANNEL, tag, owner, clock)
 	, device_serial_interface(mconfig, *this)
@@ -147,6 +161,9 @@ void te7774_channel::device_reset()
 	set_tra_rate(31250);
 
 	m_tx_enabled = m_rx_enabled = false;
+	m_tx_data_in_buffer = false;
+	m_control3 = 0;
+	m_status &= ~STATUS_TxRdy;
 }
 
 // serial device virtual overrides
@@ -165,14 +182,20 @@ void te7774_channel::rcv_complete()
 	}
 }
 
+void te7774_channel::update_tx_ready()
+{
+	if (m_tx_enabled && !m_tx_data_in_buffer)
+		m_status |= STATUS_TxRdy;
+	else
+		m_status &= ~STATUS_TxRdy;
+	const bool irq = (m_status & STATUS_TxRdy) && (m_control3 & CONTROL3_TxIntEnable);
+	m_parent->m_txrdy_handler[m_ch](irq ? ASSERT_LINE : CLEAR_LINE);
+}
+
 void te7774_channel::tra_complete()
 {
-	if (m_tx_enabled)
-	{
-		m_status |= STATUS_TxRdy; // set tx ready
-		m_parent->m_txrdy_handler[m_ch](ASSERT_LINE);
-	}
 	m_tx_data_in_buffer = false;
+	update_tx_ready();
 }
 
 void te7774_channel::tra_callback()
@@ -219,9 +242,9 @@ void te7774_channel::write(offs_t offset, uint8_t data)
 			{
 				m_tx_data = data;
 				transmit_register_setup(m_tx_data);
+				m_parent->m_txbyte_handler[m_ch](m_tx_data);
 				m_tx_data_in_buffer = true;
-				m_status &= ~STATUS_TxRdy;
-				m_parent->m_txrdy_handler[m_ch](CLEAR_LINE);
+				update_tx_ready();
 			}
 			break;
 
@@ -230,6 +253,7 @@ void te7774_channel::write(offs_t offset, uint8_t data)
 			m_rx_enabled = (data & CONTROL1_RxEnable) != 0;
 			m_control1 = data;
 			LOGMASKED(LOG_REGISTERS, "%s tx enable %d rx enable %d\n", tag(), m_tx_enabled, m_rx_enabled);
+			update_tx_ready();
 			break;
 
 		case 2: // control 2
@@ -238,6 +262,7 @@ void te7774_channel::write(offs_t offset, uint8_t data)
 
 		case 3: // control 3
 			m_control3 = data;
+			update_tx_ready();
 			break;
 	}
 }

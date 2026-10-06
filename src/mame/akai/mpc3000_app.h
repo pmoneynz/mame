@@ -11,8 +11,8 @@
 
     App events carry an absolute emulated time. The driver fires each one
     at that time and turns it into front-panel link frames (the same
-    31 250 baud serialiser as the panel HLE) or, for footswitches, HC365
-    input bits.
+    31 250 baud serialiser as the panel HLE), for footswitches HC365
+    input bits, and for MIDI IN bytes on that port's own serialiser.
 
 ***************************************************************************/
 
@@ -24,6 +24,7 @@
 #include "attotime.h"
 
 #include <cstdint>
+#include <functional>
 
 class mpc3000_app_interface
 {
@@ -35,8 +36,13 @@ public:
 		EVENT_PRESSURE = 3,     // code: pad 1..16; value: 0..127
 		EVENT_SLIDER = 4,       // value: 0..127
 		EVENT_DIAL = 5,         // value: signed steps (int8), + is clockwise
-		EVENT_FOOTSWITCH = 6    // code: 1 or 2; value: HC365 line level 0/1
+		EVENT_FOOTSWITCH = 6,   // code: 1 or 2; value: HC365 line level 0/1
+		EVENT_MIDI_IN = 7       // code: MIDI IN 1 or 2; value: one byte, sent at 31 250 baud
 	};
+
+	// MIDI OUT 1-4: called with each byte as it enters the UART's
+	// transmitter (its start bit begins at `when`).
+	using midi_out_sink = std::function<void (const attotime &when, uint8_t port, uint8_t byte)>;
 
 	static constexpr unsigned EVENT_QUEUE_SIZE = 256;
 
@@ -51,6 +57,9 @@ public:
 
 	// LED states, bit n = LED n (MAME outputs led0..led15).
 	virtual uint16_t app_leds() const = 0;
+
+	// Receive MIDI OUT bytes (nullptr to stop).
+	virtual void app_set_midi_out(midi_out_sink sink) = 0;
 };
 
 #endif // MAME_AKAI_MPC3000_APP_H
