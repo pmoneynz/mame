@@ -106,6 +106,13 @@ struct mpc3k
 	std::atomic<uint32_t> ring_target{ 132 };
 	uint32_t underruns_seen = 0;                // emulation thread
 	attotime quiet_since = attotime::zero;      // emulation thread
+	// thread hook (mpc3k_set_thread_hook): pending under hook_mutex, adopted
+	// by the emulation thread
+	struct thread_hook { mpc3k_thread_hook fn = nullptr; void *user = nullptr; };
+	std::mutex hook_mutex;
+	thread_hook hook_pending;
+	std::atomic<bool> hook_changed{ false };
+	thread_hook hook_current;                   // emulation thread
 #if defined(__APPLE__)
 	dispatch_semaphore_t ring_space = nullptr;
 #endif
@@ -222,8 +229,28 @@ void service(mpc3k &m)
 }
 
 // One sound flush: the DSP's samples since the previous flush.
+// Emulation thread: take a new hook (leave the old one first).
+void adopt_thread_hook(mpc3k &m)
+{
+	if (!m.hook_changed.load(std::memory_order_acquire))
+		return;
+	mpc3k::thread_hook next;
+	{
+		std::lock_guard<std::mutex> lock(m.hook_mutex);
+		next = m.hook_pending;
+		m.hook_pending = {};
+		m.hook_changed.store(false, std::memory_order_relaxed);
+	}
+	if (m.hook_current.fn)
+		m.hook_current.fn(m.hook_current.user, 0);
+	m.hook_current = next;
+	if (next.fn)
+		next.fn(next.user, 1);
+}
+
 void on_sound(mpc3k &m, const std::map<std::string, std::vector<std::pair<const float *, int>>> &data)
 {
+	adopt_thread_hook(m);
 	m.time_ns.store(attotime_to_ns(m.machine->time()), std::memory_order_relaxed);
 
 	auto it = data.find(":dsp");
@@ -576,6 +603,9 @@ extern "C" int mpc3k_start(mpc3k *m)
 		pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
 		m->exit_code = run_frontend(args);
+		if (m->hook_current.fn)
+			m->hook_current.fn(m->hook_current.user, 0);
+		m->hook_current = {};
 	});
 	return 0;
 }
@@ -605,6 +635,8 @@ extern "C" void mpc3k_destroy(mpc3k *m)
 		return;
 	mpc3k_stop(m);
 	mpc3k_wait(m);
+	if (m->hook_pending.fn)                     // never taken
+		m->hook_pending.fn(m->hook_pending.user, 0);
 #if defined(__APPLE__)
 	if (m->ring_space)
 		dispatch_release(m->ring_space);
@@ -711,6 +743,21 @@ extern "C" uint64_t mpc3k_lcd(mpc3k *m, uint8_t *pixels)
 extern "C" uint16_t mpc3k_leds(mpc3k *m) { return m ? m->leds.load(std::memory_order_relaxed) : 0; }
 extern "C" uint32_t mpc3k_late_events(mpc3k *m) { return m ? m->late.load(std::memory_order_relaxed) : 0; }
 extern "C" uint32_t mpc3k_underruns(mpc3k *m) { return m ? m->underruns.load(std::memory_order_relaxed) : 0; }
+extern "C" void mpc3k_set_thread_hook(mpc3k *m, mpc3k_thread_hook fn, void *user)
+{
+	if (!m)
+		return;
+	mpc3k::thread_hook replaced;
+	{
+		std::lock_guard<std::mutex> lock(m->hook_mutex);
+		replaced = m->hook_pending;             // set but not yet taken
+		m->hook_pending = { fn, user };
+		m->hook_changed.store(true, std::memory_order_release);
+	}
+	if (replaced.fn)
+		replaced.fn(replaced.user, 0);
+}
+
 extern "C" uint32_t mpc3k_ring_target(mpc3k *m) { return m ? m->ring_target.load(std::memory_order_relaxed) : 0; }
 extern "C" uint32_t mpc3k_floppy_writebacks(mpc3k *m) { return m ? m->floppy_writebacks.load(std::memory_order_acquire) : 0; }
 extern "C" int mpc3k_floppy_busy(mpc3k *m) { return m ? m->floppy_busy.load(std::memory_order_relaxed) : 0; }

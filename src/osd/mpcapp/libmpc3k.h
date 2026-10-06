@@ -32,7 +32,7 @@
 extern "C" {
 #endif
 
-#define MPC3K_API_VERSION 4
+#define MPC3K_API_VERSION 5
 
 #define MPC3K_SAMPLE_RATE    44100
 #define MPC3K_AUDIO_CHANNELS 10
@@ -147,6 +147,15 @@ uint32_t mpc3k_late_events(mpc3k *m);
 uint32_t mpc3k_ring_target(mpc3k *m);
 uint32_t mpc3k_underruns(mpc3k *m);
 uint32_t mpc3k_dropped_blocks(mpc3k *m);
+
+/* Run code on the emulation thread (SPEC.md 5.2: it joins the output
+ * device's audio workgroup, which the app only has once the device is open).
+ * The emulation thread calls fn(user, 1) at its next 1 ms slice, and
+ * fn(user, 0) exactly once later: when the hook is replaced or cleared, or
+ * as the thread ends. A hook replaced before the thread took it gets only
+ * fn(user, 0), on the caller's thread. user must stay valid until then. */
+typedef void (*mpc3k_thread_hook)(void *user, int enter);
+void mpc3k_set_thread_hook(mpc3k *m, mpc3k_thread_hook fn, void *user);
 
 /* Pause or resume emulation. */
 void mpc3k_pause(mpc3k *m, int paused);
