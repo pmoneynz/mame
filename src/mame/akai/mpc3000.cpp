@@ -1167,4 +1167,4 @@ void mpc3000_state::init_mpc3000()
 
 } // anonymous namespace
 
-CONS( 1994, mpc3000, 0, 0, mpc3000, mpc3000, mpc3000_state, init_mpc3000, "Akai / Roger Linn", "MPC3000", MACHINE_NOT_WORKING )
+CONS( 1994, mpc3000, 0, 0, mpc3000, mpc3000, mpc3000_state, init_mpc3000, "Akai / Roger Linn", "MPC3000", MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
