@@ -32,7 +32,7 @@
 extern "C" {
 #endif
 
-#define MPC3K_API_VERSION 2
+#define MPC3K_API_VERSION 3
 
 #define MPC3K_SAMPLE_RATE    44100
 #define MPC3K_AUDIO_CHANNELS 10
@@ -153,8 +153,17 @@ void mpc3k_pause(mpc3k *m, int paused);
 int mpc3k_save_state(mpc3k *m, const char *slot);
 int mpc3k_load_state(mpc3k *m, const char *slot);
 
-/* Insert (path) or eject (NULL) the floppy, asynchronously. Return 0 if queued. */
+/* Insert (path) or eject (NULL) the floppy, asynchronously. Return 0 if queued.
+ * A new insert is a disk change for the OS. */
 int mpc3k_floppy(mpc3k *m, const char *path);
+
+/* Writes by the OS reach the image file once the drive is idle (unsaved
+ * writes and the motor off for 0.5 s emulated): the count of those
+ * write-backs, and whether the drive is busy now (motor on or unsaved
+ * writes). A host syncing the image with a folder reads the file after the
+ * count changes, and replaces the disk only while the drive is not busy. */
+uint32_t mpc3k_floppy_writebacks(mpc3k *m);
+int mpc3k_floppy_busy(mpc3k *m);
 
 /* MAME command-line entry point with the headless OSD (used by the CLI
  * host for the test harness). */

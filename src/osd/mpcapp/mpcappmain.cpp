@@ -28,6 +28,7 @@
 #include "sound.h"
 
 #include "akai/mpc3000_app.h"
+#include "imagedev/floppy.h"
 
 #include "modules/diagnostics/diagnostics_module.h"
 #include "modules/lib/osdobj_common.h"
@@ -111,6 +112,8 @@ struct mpc3k
 	std::atomic<uint64_t> frames{ 0 };
 	std::atomic<uint16_t> leds{ 0 };
 	std::atomic<uint32_t> late{ 0 }, underruns{ 0 }, dropped{ 0 };
+	std::atomic<uint32_t> floppy_writebacks{ 0 };
+	std::atomic<bool> floppy_busy{ false };
 	std::mutex lcd_mutex;
 	uint8_t lcd[MPC3K_LCD_WIDTH * MPC3K_LCD_HEIGHT]{};
 	uint64_t lcd_seq = 0;
@@ -119,6 +122,9 @@ struct mpc3k
 	running_machine *machine = nullptr;
 	mpc3000_app_interface *app = nullptr;
 	bool ready = false;             // devices started (first reset seen)
+	floppy_image_device *floppy_device = nullptr;
+	attotime floppy_idle_since = attotime::never;
+	bool floppy_was_dirty = false;
 	bool exit_scheduled = false;
 	std::vector<uint32_t> pixel_buffer;
 };
@@ -287,10 +293,41 @@ void on_sound(mpc3k &m, const std::map<std::string, std::vector<std::pair<const 
 	service(m);
 }
 
+// Keep the floppy image file up to date with the OS's writes. MAME writes
+// the image back when the drive motor turns off; as a fallback, unsaved
+// writes still pending 0.5 s (emulated) after the motor is off are written
+// here. Every dirty -> clean change counts as a write-back for the host.
+void sync_floppy(mpc3k &m)
+{
+	floppy_image_device *fl = m.floppy_device;
+	if (!fl)
+		return;
+	const bool motor_on = !fl->mon_r();
+	bool dirty = fl->is_dirty();
+	const attotime now = m.machine->time();
+	if (dirty && !motor_on)
+	{
+		if (m.floppy_idle_since == attotime::never)
+			m.floppy_idle_since = now;
+		else if (now - m.floppy_idle_since >= attotime::from_msec(500))
+		{
+			fl->flush();
+			dirty = fl->is_dirty();
+		}
+	}
+	else
+		m.floppy_idle_since = attotime::never;
+	if (m.floppy_was_dirty && !dirty)
+		m.floppy_writebacks.fetch_add(1, std::memory_order_release);
+	m.floppy_was_dirty = dirty;
+	m.floppy_busy.store(motor_on || dirty, std::memory_order_relaxed);
+}
+
 // One video frame: LCD pixels and LEDs.
 void on_frame(mpc3k &m)
 {
 	running_machine &machine = *m.machine;
+	sync_floppy(m);
 	if (m.app)
 		m.leds.store(m.app->app_leds(), std::memory_order_relaxed);
 
@@ -358,6 +395,9 @@ public:
 			sound->set_sound_hook(true);
 		m->machine->sound().set_sound_observer(
 				[m] (const std::map<std::string, std::vector<std::pair<const float *, int>>> &data) { on_sound(*m, data); });
+		m->floppy_device = nullptr;
+		if (floppy_connector *con = m->machine->root_device().subdevice<floppy_connector>("fdc:0"))
+			m->floppy_device = con->get_device();
 		m->ready = true;
 	}
 
@@ -375,6 +415,7 @@ public:
 			g_machine->machine->sound().set_sound_observer(nullptr);
 			g_machine->machine = nullptr;
 			g_machine->app = nullptr;
+			g_machine->floppy_device = nullptr;
 			g_machine->ready = false;
 		}
 		osd_common_t::osd_exit();
@@ -658,6 +699,8 @@ extern "C" uint64_t mpc3k_lcd(mpc3k *m, uint8_t *pixels)
 extern "C" uint16_t mpc3k_leds(mpc3k *m) { return m ? m->leds.load(std::memory_order_relaxed) : 0; }
 extern "C" uint32_t mpc3k_late_events(mpc3k *m) { return m ? m->late.load(std::memory_order_relaxed) : 0; }
 extern "C" uint32_t mpc3k_underruns(mpc3k *m) { return m ? m->underruns.load(std::memory_order_relaxed) : 0; }
+extern "C" uint32_t mpc3k_floppy_writebacks(mpc3k *m) { return m ? m->floppy_writebacks.load(std::memory_order_acquire) : 0; }
+extern "C" int mpc3k_floppy_busy(mpc3k *m) { return m ? m->floppy_busy.load(std::memory_order_relaxed) : 0; }
 extern "C" uint32_t mpc3k_dropped_blocks(mpc3k *m) { return m ? m->dropped.load(std::memory_order_relaxed) : 0; }
 
 namespace {
