@@ -92,12 +92,20 @@
         A = loop start address, bits 23-20
 
     3  ----------------   vvvvvvvvvvvvvvvv   ----------------
-        v = volume envelope starting value (16 bit unsigned)
+        v = volume envelope starting value: level in bits 14-0, bit 15 a
+            flag kept as written (read back with the current level)
 
     4  ----------------   vvvvvvvvvvvvvvvv   rrrrrrrrrrrrrrrr
-        v = volume envelope target value
-        r = volume envelope rate in 8.8 fixed point (0x100 = change the
-            volume by 1 sample per sample)
+        v = volume envelope target value (same layout)
+        r = volume envelope rate, signed, in 1/8 level steps per sample
+
+        MPC3000 (Vailixi 3.50 traces): for Attack A ms the OS writes the
+        rate 2978 / A (Attack 0: rate = the whole distance); for Decay D ms
+        it writes -(distance * 8 / 44.1 D), e.g. FF5B (-165) over 3FFF for
+        D = 18. With a 15-bit level moved |r| / 8 per sample these take
+        exactly A and D ms, the manual's units (Attack and Decay: 0-5000
+        ms). Level 4000 is unity gain (velocity 127, volume 100 writes
+        3FFF). Encoding and gain: HYPOTHESIS (no datasheet, no recording).
 
     5  ----------------   cccccccccccccccc   ----------------
         c = lowpass filter cutoff frequency (16 bit, 0xffff = the Nyquist frequency)
@@ -149,6 +157,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <numbers>
 
 #define LOG_REGISTERS           (1U << 1)
@@ -438,21 +447,21 @@ void l7a1045_sound_device::sound_stream_update(sound_stream &stream)
 				const int32_t sample = interpolated_sample(*vptr, start + pos, frac);
 				frac += step;
 
-				// volume envelope processing
-				vptr->env_pos += vptr->env_step;
-				const int steps = ((uint32_t)vptr->env_pos / 0x100);
+				// volume envelope processing: 15-bit level, |rate| / 8 per sample
+				vptr->env_pos += std::abs(int(int16_t(vptr->env_step)));
+				const int steps = int(vptr->env_pos >> 3);
+				vptr->env_pos &= 7;
 				if (steps > 0)
 				{
-					if (vptr->env_volume < vptr->env_target)
-					{
-						vptr->env_volume += std::min(steps, (vptr->env_target - vptr->env_volume));
-					}
-					else if (vptr->env_volume > vptr->env_target)
-					{
-						vptr->env_volume -= std::min(steps, (vptr->env_volume - vptr->env_target));
-					}
+					int level = vptr->env_volume & 0x7fff;
+					const int target = vptr->env_target & 0x7fff;
+					if (level < target)
+						level += std::min(steps, target - level);
+					else if (level > target)
+						level -= std::min(steps, level - target);
+					vptr->env_volume = (vptr->env_target & 0x8000) | level;
 				}
-				vptr->env_pos &= 0xff;
+				const uint64_t gain = uint64_t(vptr->env_volume & 0x7fff) << 2;     // 0x4000 = unity
 
 				// filter envelope processing
 				vptr->flt_pos += vptr->flt_step;
@@ -485,8 +494,8 @@ void l7a1045_sound_device::sound_stream_update(sound_stream &stream)
 				vptr->l += (int64_t(vptr->flt_freq) * vptr->b) >> 15;
 
 				const int32_t fout = vptr->l;
-				const int64_t left = (fout * (uint64_t(vptr->l_volume) * uint64_t(vptr->env_volume))) >> 24;
-				const int64_t right = (fout * (uint64_t(vptr->r_volume) * uint64_t(vptr->env_volume))) >> 24;
+				const int64_t left = (fout * (uint64_t(vptr->l_volume) * gain)) >> 24;
+				const int64_t right = (fout * (uint64_t(vptr->r_volume) * gain)) >> 24;
 				stream.add_int(0, j, left, 32768);
 				stream.add_int(1, j, right, 32768);
 
@@ -495,7 +504,7 @@ void l7a1045_sound_device::sound_stream_update(sound_stream &stream)
 					const int dest = vptr->send_dest & 0xf;
 					if (dest != 0xf)
 					{
-						const int64_t send = (fout * (uint64_t(vptr->send_level) * uint64_t(vptr->env_volume))) >> 24;
+						const int64_t send = (fout * (uint64_t(vptr->send_level) * gain)) >> 24;
 						stream.add_int(2 + channel_remap[dest], j, send, 32768);
 					}
 				}
