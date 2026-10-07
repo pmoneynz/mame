@@ -78,7 +78,10 @@ private:
 		uint8_t send_dest = 0;
 		uint8_t send_level = 0;
 		uint8_t sample_type = 0; // 0 = 16-bit, 1 = 12-bit non-linear
+		uint8_t setup = 0; // since the last key-on: bit 0 start (reg 0) written, bit 1 envelope target (reg 4)
 	};
+
+	void key_on(int channel);
 
 	devcb_write_line m_drq_handler;
 	sound_stream    *m_stream;

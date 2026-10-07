@@ -297,6 +297,7 @@ void l7a1045_sound_device::device_start()
 	save_item(STRUCT_MEMBER(m_voice, env_target));
 	save_item(STRUCT_MEMBER(m_voice, env_step));
 	save_item(STRUCT_MEMBER(m_voice, env_pos));
+	save_item(STRUCT_MEMBER(m_voice, setup));
 	save_item(STRUCT_MEMBER(m_voice, flt_freq));
 	save_item(STRUCT_MEMBER(m_voice, flt_target));
 	save_item(STRUCT_MEMBER(m_voice, flt_step));
@@ -600,6 +601,7 @@ void l7a1045_sound_device::voiceregs_w(offs_t offset, uint16_t data)
 	{
 		// sample start address
 		case L6028_Start:
+			vptr->setup |= 1;
 			vptr->start = (m_regs[L6028_Start][m_cur_channel] >> 12) & 0x00ff'ffff;
 			vptr->sample_type = (m_regs[L6028_Start][m_cur_channel] >> 36) & 0xf;
 
@@ -648,6 +650,7 @@ void l7a1045_sound_device::voiceregs_w(offs_t offset, uint16_t data)
 
 		// envelope target volumes plus step rate
 		case L6028_Volume_Env_Target:
+			vptr->setup |= 2;
 			vptr->env_target = (m_regs[L6028_Volume_Env_Target][m_cur_channel] & 0xffff'0000) >> 16;
 			vptr->env_step = m_regs[L6028_Volume_Env_Target][m_cur_channel] & 0xffff;
 			break;
@@ -724,22 +727,16 @@ void l7a1045_sound_device::control_w(uint16_t data)
 
 	if (BIT(data, CONTROL_KEY_ON))
 	{
-		l7a1045_voice* const vptr = &m_voice[m_cur_channel];
-
-		vptr->frac = 0;
-		vptr->pos = 0;
-		vptr->history_count = 0;
-		vptr->flt_pos = 0;
-		vptr->l = vptr->b = 0;
-		vptr->env_pos = 0;
-		m_key |= 1 << m_cur_channel;
-
-		recalc_loop_start(vptr);
-
-		LOGMASKED(LOG_KEYON, "ch %d key on start %08x end %08x loop %08x mixer %016llx\n", m_cur_channel, vptr->start, vptr->end, vptr->loop_start, m_regs[L6028_Mixer_Params][m_cur_channel]);
-		LOGMASKED(LOG_KEYON, "      raw 0 %012llx 1 %012llx 2 %012llx\n", m_regs[0][m_cur_channel], m_regs[1][m_cur_channel], m_regs[2][m_cur_channel]);
-		LOGMASKED(LOG_KEYON, "      raw 3 %012llx 4 %012llx 5 %012llx\n", m_regs[3][m_cur_channel], m_regs[4][m_cur_channel], m_regs[5][m_cur_channel]);
-		LOGMASKED(LOG_KEYON, "      raw 6 %012llx 7 %012llx\n", m_regs[6][m_cur_channel], m_regs[7][m_cur_channel]);
+		// A key-on starts the selected voice and every other voice set up
+		// (start and envelope target written) since its last key-on. The
+		// MPC3000 OS sets up both voices of a stereo sound (e.g. channels 1
+		// and 3, panned left and right) and keys on once, on the second.
+		// HYPOTHESIS: no datasheet; boot writes only start addresses and
+		// releases only envelopes, so neither arms a voice.
+		key_on(m_cur_channel);
+		for (int ch = 0; ch < 32; ch++)
+			if (ch != m_cur_channel && m_voice[ch].setup == 3)
+				key_on(ch);
 	}
 
 	if (BIT(m_control, CONTROL_DMA_START))
@@ -751,6 +748,32 @@ void l7a1045_sound_device::control_w(uint16_t data)
 	else
 	{
 		m_dma_timer->adjust(attotime::never);
+	}
+}
+
+void l7a1045_sound_device::key_on(int channel)
+{
+	{
+		const int saved = m_cur_channel;
+		m_cur_channel = channel;    // recalc_loop_start reads this channel's registers
+		l7a1045_voice* const vptr = &m_voice[channel];
+		vptr->setup = 0;
+
+		vptr->frac = 0;
+		vptr->pos = 0;
+		vptr->history_count = 0;
+		vptr->flt_pos = 0;
+		vptr->l = vptr->b = 0;
+		vptr->env_pos = 0;
+		m_key |= 1 << channel;
+
+		recalc_loop_start(vptr);
+
+		LOGMASKED(LOG_KEYON, "ch %d key on start %08x end %08x loop %08x mixer %016llx\n", m_cur_channel, vptr->start, vptr->end, vptr->loop_start, m_regs[L6028_Mixer_Params][m_cur_channel]);
+		LOGMASKED(LOG_KEYON, "      raw 0 %012llx 1 %012llx 2 %012llx\n", m_regs[0][m_cur_channel], m_regs[1][m_cur_channel], m_regs[2][m_cur_channel]);
+		LOGMASKED(LOG_KEYON, "      raw 3 %012llx 4 %012llx 5 %012llx\n", m_regs[3][m_cur_channel], m_regs[4][m_cur_channel], m_regs[5][m_cur_channel]);
+		LOGMASKED(LOG_KEYON, "      raw 6 %012llx 7 %012llx\n", m_regs[6][m_cur_channel], m_regs[7][m_cur_channel]);
+		m_cur_channel = saved;
 	}
 }
 
