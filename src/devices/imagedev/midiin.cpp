@@ -82,6 +82,31 @@ void midiin_device::device_start()
 	m_timer = timer_alloc(FUNC(midiin_device::midi_update), this);
 	m_midi.reset();
 	m_timer->enable(false);
+
+	m_xmit_read = m_xmit_write = 0;
+	m_tx_busy = false;
+	save_item(NAME(m_xmitring));
+	save_item(NAME(m_xmit_read));
+	save_item(NAME(m_xmit_write));
+	save_item(NAME(m_tx_busy));
+	// m_sequence_start is not saved: it belongs to the file this run loaded
+}
+
+void midiin_device::device_post_load()
+{
+	// The state may come from a run that played a different file.  Play the
+	// file loaded now from the restored machine time: events before it are
+	// skipped, the next one is scheduled as midi_update would.
+	if (m_midi)
+		return;     // live input: its periodic poll timer is restored as saved
+	attotime const now = machine().time();
+	attotime const elapsed = (now < m_sequence_start) ? attotime::zero : now - m_sequence_start;
+	m_sequence.seek(elapsed);
+	midi_event const *const event = m_sequence.current_event();
+	if (event == nullptr)
+		m_timer->enable(false);
+	else
+		m_timer->adjust(std::min((now < m_sequence_start) ? m_sequence_start - now : event->time() - elapsed, attotime(1, 0)));
 }
 
 void midiin_device::device_reset()

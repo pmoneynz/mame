@@ -57,6 +57,7 @@ protected:
 	virtual ioport_constructor device_input_ports() const override ATTR_COLD;
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
+	virtual void device_post_load() override;
 
 	// device_serial_interface implementation
 	virtual void tra_complete() override;    // Tx completed sending byte
@@ -166,6 +167,8 @@ private:
 
 		// rewind to the start of time
 		void rewind(attotime const &basetime);
+		// position at the first event at or after `time` (relative to the start)
+		void seek(attotime const &time) { m_iterator = m_list.begin(); while (m_iterator != m_list.end() && m_iterator->time() < time) ++m_iterator; }
 		midi_event *current_event() const { return (m_iterator == m_list.end()) ? nullptr : &(*m_iterator); }
 		midi_event *advance_event() { ++m_iterator; return current_event(); }
 		attotime const &duration() { return m_list.back().time(); }
